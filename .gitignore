@@ -1,0 +1,28 @@
+# Sensitive data
+RADET/
+linelist/
+safe-nmrs_toolkit/
+nmrs_config.ini
+facilities.txt
+.nmrs_config.ini
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+build/
+dist/
+*.spec
+NMRSToolkit_Ubuntu_v1_0_0/
+NMRSToolkit_Ubuntu_v1_0_0.zip
+bundles/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+EOF
+
