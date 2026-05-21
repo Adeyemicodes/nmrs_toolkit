@@ -1419,8 +1419,8 @@ class NMRSToolkitApp:
         (columns, rows, statement_count) for the LAST result set that produced rows.
 
         Two execution paths:
-          * No DELIMITER directives -> mysql.connector's multi=True iterator
-            (faster, fewer round-trips).
+          * No DELIMITER directives -> run the whole script in one execute()
+            and walk the result sets (see _iter_result_sets; fewer round-trips).
           * DELIMITER directives present (e.g. EAC script's CREATE FUNCTION
             blocks) -> parse the script honoring the active delimiter per
             segment and execute statements one at a time. DELIMITER is a CLI
@@ -1445,7 +1445,7 @@ class NMRSToolkitApp:
                             cols = [d[0] for d in cursor.description]
                             rows = cursor.fetchall()
                 else:
-                    for result in cursor.execute(sql, multi=True):
+                    for result in self._iter_result_sets(cursor, sql):
                         stmt_count += 1
                         if result.with_rows:
                             cols = [d[0] for d in result.description]
@@ -1458,6 +1458,32 @@ class NMRSToolkitApp:
             except Exception:
                 pass
         return cols, rows, stmt_count
+
+    @staticmethod
+    def _iter_result_sets(cursor, sql):
+        """Run a (possibly multi-statement) `sql` and yield each result set as
+        an object exposing .with_rows / .description / .fetchall().
+
+        Bridges a mysql-connector-python API change so the same code works
+        whether the build machine has 8.x or 9.x installed:
+          * 8.x: cursor.execute(sql, multi=True) returns a lazy iterator of
+            per-statement result cursors.
+          * 9.x: the `multi` argument was removed (passing it raises TypeError).
+            A single execute() runs every statement — MULTI_STATEMENTS is on by
+            default — and later result sets are reached via nextset().
+        """
+        try:
+            multi_iter = cursor.execute(sql, multi=True)
+        except TypeError:
+            # 9.x — `multi` gone. execute() ran all statements; walk the results.
+            cursor.execute(sql)
+            while True:
+                yield cursor
+                if not cursor.nextset():
+                    break
+        else:
+            # 8.x — statements run lazily as we consume the iterator.
+            yield from multi_iter
 
     @classmethod
     def _has_delimiter_directive(cls, sql):
