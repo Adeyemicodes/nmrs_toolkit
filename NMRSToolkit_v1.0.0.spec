@@ -60,6 +60,19 @@ a = Analysis(
         'mysql.connector.locales',
         'mysql.connector.locales.eng',
         'mysql.connector.locales.eng.client_error',
+        # mysql-connector-python 9.x loads each auth plugin via a dynamic
+        # importlib.import_module(f".{plugin_name}", "mysql.connector.plugins")
+        # in get_auth_plugin(). PyInstaller's static analyser can't see that
+        # f-string import, so the plugin modules are dropped and login fails
+        # with "Authentication plugin '...' is not supported". List the
+        # password-based plugins explicitly. (Kerberos/LDAP/OCI/WebAuthn plugins
+        # are omitted: they need heavy optional third-party packages and aren't
+        # used for standard MySQL password auth.)
+        'mysql.connector.plugins',
+        'mysql.connector.plugins.mysql_native_password',
+        'mysql.connector.plugins.caching_sha2_password',
+        'mysql.connector.plugins.sha256_password',
+        'mysql.connector.plugins.mysql_clear_password',
     ] + _crypto_hiddenimports,
     hookspath=[],
     hooksconfig={},
