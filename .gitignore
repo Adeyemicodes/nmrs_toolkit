@@ -15,7 +15,6 @@ __pycache__/
 # Build artifacts
 build/
 dist/
-*.spec
 NMRSToolkit_Ubuntu_v1_0_0/
 NMRSToolkit_Ubuntu_v1_0_0.zip
 bundles/

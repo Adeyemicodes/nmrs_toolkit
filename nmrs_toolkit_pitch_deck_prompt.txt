@@ -1,0 +1,195 @@
+================================================================
+NMRS TOOLKIT — PITCH DECK PROMPT FOR CLAUDE
+================================================================
+HOW TO USE: Copy everything between the >>> START and <<< END
+markers and paste it into Claude (claude.ai Artifacts or Claude
+Code). It will generate a single self-contained HTML pitch deck.
+After the prompt you'll find: (A) things only you can fill in,
+and (B) optional add-on slides.
+================================================================
+
+
+>>> START OF PROMPT >>>
+
+You are an expert presentation designer and front-end developer. Build me a
+polished, presenter-ready PITCH DECK as a single self-contained HTML file
+(inline CSS + vanilla JS, no external libraries or fonts that require a network
+— it must run fully offline, which is fitting because the product itself is
+offline-first).
+
+============================================================
+PRODUCT
+============================================================
+Name: NMRS Toolkit
+What it is: A cross-platform desktop application (Windows + Ubuntu) for program
+data managers and M&E teams who work with exports from the Nigeria Medical
+Record System (NMRS). It replaces fragile, risky spreadsheet-and-SQL workflows
+with one secure workbench for generating line lists, creating/managing the
+database, and making encrypted backups you can actually recover from.
+Origin: Built for HIV program workflows; designed to extend to other diseases.
+One-line value: "Patient data, locked down. Line lists, made simple."
+
+Always expand NMRS as "Nigeria Medical Record System (NMRS)" on first mention.
+
+============================================================
+AUDIENCE
+============================================================
+Mixed / general: donors and implementing partners, government/national program
+stakeholders, and the facility & program managers who use it daily. Keep copy
+plain-language and confident. Use precise security terms (AES-GCM, encryption
+at rest) but always pair them with a one-line plain explanation so a
+non-technical viewer never feels lost.
+
+============================================================
+NARRATIVE & SLIDE CONTENT (7 slides — use this copy, refine wording lightly)
+============================================================
+SLIDE 1 — TITLE
+  Title: NMRS Toolkit
+  Tagline: Patient data, locked down. Line lists, made simple.
+  Subtitle: A secure, offline-first desktop toolkit for line lists, encrypted
+  backups, and safe recovery — built for the Nigeria Medical Record System (NMRS).
+  Visual: a subtle, tasteful animated shield/lock motif.
+
+SLIDE 2 — THE RISK ("Health data is now a prime target")
+  Body: Healthcare is among the most-attacked sectors in the world for
+  ransomware and data breaches. For HIV programs the stakes are higher than a
+  fine — disclosing someone's status can cost them their job, family, or
+  safety. Confidentiality here is a safety issue, not just compliance. Yet
+  patient-level data still routinely sits UNENCRYPTED on laptops, USB drives,
+  and shared folders.
+  Three stat tiles (leave as editable placeholders, styled prominently):
+    [ ## ] one of the most-targeted sectors for ransomware
+    [ ## ] of breaches trace back to lost or stolen devices
+    [ ## ] sensitive patient records per facility export
+  Add a small note: "Nigeria Data Protection Act (NDPA) 2023 makes safeguarding
+  this data a legal duty."
+
+SLIDE 3 — THE STATUS QUO ("How it's done today — and why it's fragile")
+  Two side-by-side cards:
+   Card A — "Running SQL directly in MySQL Workbench"
+     - The full, unencrypted database sits open on a laptop
+     - Anyone with the machine can read every patient record
+     - Requires SQL skills; one wrong query can corrupt data
+     - Trivial to copy patient data out undetected
+     - No recovery path if the laptop is lost, stolen, or ransomed
+   Card B — "Relying on the NDR (National Data Repository) alone"
+     - No controlled local working copy you own
+     - Dependent on connectivity and upstream uptime
+     - Limited flexibility for the analysis teams actually need
+     - If it's down or out of sync, work stops — and recovery isn't in your hands
+
+SLIDE 4 — THE TOOLKIT ("One secure workbench for the whole workflow")
+  Six feature cards, each with an icon, title, one-line description:
+   - Guided line lists — generate them with clicks, no SQL, no risky queries
+   - Encrypted automatic backups — daily, on startup and weekday afternoons
+   - Safe restore — typed confirmation + an automatic pre-restore safety backup
+   - Per-facility encryption — each site's data sealed with its own key
+   - Manager-controlled keys — decryption is gated and governed, not open
+   - Offline-first — fully functional without a live connection to anything
+
+SLIDE 5 — SECURITY ARCHITECTURE ("Security built into every layer")
+  Lead line: Defense in depth, designed in — not bolted on.
+  Points (concise, with plain-language tails):
+   - AES-GCM encryption at rest — data on disk is unreadable without the key
+   - Per-facility keys derived from a manager-held master secret via HMAC —
+     compromise one site and the rest stay safe (limited blast radius)
+   - Keys never live in the source code
+   - Encrypted daily backups (on startup + 14:00 weekdays) with retention pruning
+     — your answer to ransomware and hardware loss
+   - Manager-gated decryption + a standalone decryptor for clean recovery
+   - Hardened config: hidden, stored in a secure per-platform location, locked to
+     owner-only permissions (chmod 600)
+  Include a small left-to-right flow diagram:
+     Manager master secret -> HMAC -> per-facility key -> AES-GCM encrypts DB & backups
+
+SLIDE 6 — BEFORE / AFTER (comparison table)
+  Columns: "Risk"  |  "Today (Workbench + NDR-only)"  |  "With NMRS Toolkit"
+  Rows:
+    Data at rest            | Plaintext on disk        | AES-GCM encrypted
+    Who can read it         | Anyone with the laptop   | Only the key holder
+    Lost / stolen device    | Full data leak           | Useless without the key
+    Ransomware              | Total loss               | Restore from encrypted backup
+    NDR outage / offline    | Work stops               | Keeps working locally
+    Skill required          | SQL knowledge            | Point and click
+    Recovery & governance   | Ad hoc / none            | Built-in, manager-controlled
+  Style the "Today" column in muted warning tones, the "Toolkit" column in
+  confident success tones.
+
+SLIDE 7 — WHAT'S NEXT / THE ASK
+  Roadmap: an in-app analytics dashboard (cohort, treatment-outcome, and trend
+  analyses) so sensitive analysis never has to leave the secure app; and
+  extension beyond HIV to additional disease areas.
+  The ask (editable placeholder): "Pilot at [N] facilities" / "Endorse for
+  rollout" / "Fund the dashboard build."
+  Close with a clear call to action and a contact line (placeholder).
+
+============================================================
+DESIGN SYSTEM
+============================================================
+Mood: trustworthy, modern, secure — "fortress meets clinic." Clean, not flashy.
+Palette:
+  - Base: deep midnight/navy (#0B1F3A or similar) for trust & security
+  - Accent: medical teal/green (#1FB6A6-ish) for health & "safe/yes"
+  - Warning: warm amber/red used SPARINGLY, only on the threat & "today" content
+  - Surfaces: near-white cards (#F7FAFC) on dark, with generous whitespace
+  - High contrast everywhere; ensure WCAG-AA legibility
+Typography: a strong, clean geometric sans via system font stack
+  (e.g., Inter/Segoe/Helvetica). Big confident headlines, calm body text.
+Iconography: simple line/solid icons — shield, padlock, key, database, backup
+  arrows, hospital/facility, offline cloud. Draw as inline SVG (no icon CDN).
+Motifs: shields, locks, the key-derivation flow, "encrypted block" textures.
+Each slide: 16:9, consistent header/footer, slide number, a subtle progress bar.
+
+============================================================
+FUNCTIONAL / TECHNICAL REQUIREMENTS
+============================================================
+- One single .html file, fully self-contained, works by double-clicking offline.
+- 16:9 slides that scale responsively to fill the viewport (letterbox if needed).
+- Navigation: Left/Right arrow keys, on-screen Prev/Next buttons, and clickable
+  dot indicators. Spacebar advances. Show "current / total" counter.
+- Smooth, tasteful slide transitions; respect prefers-reduced-motion.
+- A "P" key or button toggles a clean print/PDF view (each slide on its own page)
+  so it exports to PDF nicely.
+- All text content placed in clearly-marked, easy-to-edit spots near the top of
+  the JS/HTML so I can update copy and the stat placeholders without hunting.
+- No analytics, no external calls — nothing leaves the machine.
+
+============================================================
+TONE
+============================================================
+Confident and plain-spoken. Slightly urgent on Slide 2 (the threat), reassuring
+and solid from Slide 4 onward. Avoid hype and jargon-for-its-own-sake. Every
+claim should feel verifiable and grounded.
+
+Deliver the complete HTML file, ready to run.
+
+<<< END OF PROMPT <<<
+
+
+================================================================
+(A) BEFORE YOU SEND IT — FILL THESE IN (only you can)
+================================================================
+- Real numbers for Slide 2. The three stat tiles are placeholders on purpose —
+  do not invent figures. Pull verified ones from sources like the IBM Cost of a
+  Data Breach report (healthcare cost), Verizon DBIR (lost/stolen device
+  breaches), or HHS/ENISA health-sector reports. Your own "records per facility
+  export" number is the most powerful one — use a real figure you can defend.
+- The NDPA 2023 line is accurate (signed into law June 2023, enforced by the
+  Nigeria Data Protection Commission) — keep it; it's a strong, true hook.
+- The ask on Slide 7 — number of pilot facilities, who you're asking, contact.
+- Logo / branding — if you have a logo or partner/funder logos, say so and
+  Claude will place them; otherwise the typographic title works fine.
+- License — still TBD; leave it off the deck until decided.
+
+================================================================
+(B) OPTIONAL ADD-ON SLIDES (paste in if you want a longer deck)
+================================================================
+- "How it works in 3 steps" — Open the toolkit -> pick a facility & run the
+  line list -> it auto-encrypts and backs up. Great for showing how easy it is
+  vs. Workbench.
+- "Live walkthrough / screenshots" — a slide reserved for app screenshots
+  (most convincing single thing you can add — tell Claude to leave image
+  placeholders).
+- "Who it's for" — facility users vs. program managers vs. donors, and what
+  each group gets.
+================================================================

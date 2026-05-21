@@ -1,0 +1,8 @@
+# Runtime dependencies for NMRS Toolkit (nmrs_toolkit.py).
+# Install into the SAME interpreter you build with, before running build.py:
+#     python -m pip install -r requirements.txt
+#
+# tkinter is also required but ships with the python.org installer
+# (select the "tcl/tk and IDLE" component) — it is not pip-installable.
+cryptography
+mysql-connector-python
