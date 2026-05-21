@@ -36,6 +36,25 @@ from mysql.connector import Error
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
+# Every MySQL connection routes through db_connect() so we can pin the
+# pure-Python protocol implementation. mysql-connector-python prefers its C
+# extension (_mysql_connector) when installed, but PyInstaller freezes the
+# extension WITHOUT the native authentication-plugin libraries it loads at
+# runtime — so the frozen build fails with "Authentication plugin
+# 'mysql_native_password' cannot be loaded: The specified module could not be
+# found." The pure-Python client implements those auth plugins itself (using the
+# bundled `cryptography` package for caching_sha2_password), so it works inside
+# a single-file binary. We capture the original connect() up front so this
+# wrapper isn't caught by the call-site rename.
+_mysql_connect = mysql_connector.connect
+
+
+def db_connect(**kwargs):
+    """mysql.connector.connect() pinned to the pure-Python client (use_pure)."""
+    kwargs.setdefault("use_pure", True)
+    return _mysql_connect(**kwargs)
+
+
 APP_NAME = "NMRS Toolkit"
 APP_VERSION = "1.0.0"
 
@@ -471,7 +490,7 @@ def _facility_slug(config: configparser.ConfigParser, log_func=print) -> str:
 
     db = config["database"]
     try:
-        conn = mysql_connector.connect(
+        conn = db_connect(
             host=db["host"], user=db["user"], password=db["password"],
             database=db["database"], port=int(db.get("port", 3306)),
             connection_timeout=8,
@@ -505,7 +524,7 @@ def _wait_for_mysql(db_cfg, log_func=print, max_wait_s: int = 60) -> None:
     last_err = None
     while time.monotonic() < deadline:
         try:
-            conn = mysql_connector.connect(
+            conn = db_connect(
                 host=db_cfg["host"], user=db_cfg["user"], password=db_cfg["password"],
                 database=db_cfg["database"], port=int(db_cfg.get("port", 3306)),
                 connection_timeout=5,
@@ -726,7 +745,7 @@ def _shred_unlink(path: Path) -> None:
 
 
 def _mysql_db_exists(db_cfg, db_name: str) -> bool:
-    conn = mysql_connector.connect(
+    conn = db_connect(
         host=db_cfg["host"], user=db_cfg["user"], password=db_cfg["password"],
         port=int(db_cfg.get("port", 3306)), connection_timeout=8,
     )
@@ -740,7 +759,7 @@ def _mysql_db_exists(db_cfg, db_name: str) -> bool:
 
 def _mysql_admin(db_cfg, statements):
     """Run admin statements with no database selected. `statements` is iterable."""
-    conn = mysql_connector.connect(
+    conn = db_connect(
         host=db_cfg["host"], user=db_cfg["user"], password=db_cfg["password"],
         port=int(db_cfg.get("port", 3306)), connection_timeout=8,
     )
@@ -816,7 +835,7 @@ def _dump_database(db_cfg, log_func) -> bytes:
 
 def _python_dump(db_cfg) -> bytes:
     """Naive Python-side dump: schema + data, INSERT statements, no triggers/routines."""
-    conn = mysql_connector.connect(
+    conn = db_connect(
         host=db_cfg["host"],
         user=db_cfg["user"],
         password=db_cfg["password"],
@@ -1115,7 +1134,7 @@ class NMRSToolkitApp:
             if self.connection and self.connection.is_connected():
                 return self.connection
             db = self.config["database"]
-            self.connection = mysql_connector.connect(
+            self.connection = db_connect(
                 host=db["host"], user=db["user"], password=db["password"],
                 database=db["database"], port=int(db.get("port", 3306)),
             )
@@ -1408,7 +1427,7 @@ class NMRSToolkitApp:
             meta-command and mysql.connector cannot process it directly.
         """
         db = self.config["database"]
-        conn = mysql_connector.connect(
+        conn = db_connect(
             host=db["host"], user=db["user"], password=db["password"],
             database=db["database"], port=int(db.get("port", 3306)),
             autocommit=True,
@@ -2727,7 +2746,7 @@ class NMRSToolkitApp:
 
     def _restore_verify(self, db_cfg, target_db: str, ui_log):
         """Post-import sanity check: table count > 0; if known tables exist, sample row counts."""
-        conn = mysql_connector.connect(
+        conn = db_connect(
             host=db_cfg["host"], user=db_cfg["user"], password=db_cfg["password"],
             database=target_db,
             port=int(db_cfg.get("port", 3306)), connection_timeout=10,
