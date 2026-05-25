@@ -55,6 +55,14 @@ def db_connect(**kwargs):
     return _mysql_connect(**kwargs)
 
 
+# A windowed (no-console) Windows build still pops a visible console window for
+# every child process it spawns — mysqldump, the mysql restore client, schtasks.
+# To a non-technical user that flash looks like an error, and closing it can
+# interrupt a running backup. CREATE_NO_WINDOW runs them silently. The attribute
+# exists only on Windows, so guard on the platform first; 0 is a no-op elsewhere.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+
+
 APP_NAME = "NMRS Toolkit"
 APP_VERSION = "1.0.0"
 
@@ -387,7 +395,7 @@ def install_backup_schedule(binary_path: Path) -> str:
         # Remove any old entries first so re-install is clean.
         for tn in ("NMRSBackup", "NMRSBackup_Boot"):
             subprocess.run(["schtasks", "/delete", "/f", "/tn", tn],
-                           capture_output=True)
+                           capture_output=True, creationflags=_NO_WINDOW)
         # Daily 14:00 Mon-Fri
         subprocess.run([
             "schtasks", "/create", "/f",
@@ -396,14 +404,14 @@ def install_backup_schedule(binary_path: Path) -> str:
             "/st", "14:00",
             "/tn", "NMRSBackup",
             "/tr", f'"{binary_path}" --backup',
-        ], check=True, capture_output=True)
+        ], check=True, capture_output=True, creationflags=_NO_WINDOW)
         # On startup
         subprocess.run([
             "schtasks", "/create", "/f",
             "/sc", "onstart",
             "/tn", "NMRSBackup_Boot",
             "/tr", f'"{binary_path}" --backup',
-        ], check=True, capture_output=True)
+        ], check=True, capture_output=True, creationflags=_NO_WINDOW)
         return (f"Windows scheduled tasks 'NMRSBackup' (14:00 Mon-Fri) and "
                 f"'NMRSBackup_Boot' (on startup) -> {binary_path} --backup")
 
@@ -438,11 +446,11 @@ def schedule_status() -> str:
     if system == "Windows":
         daily = subprocess.run(
             ["schtasks", "/query", "/tn", "NMRSBackup"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, creationflags=_NO_WINDOW,
         ).returncode == 0
         boot = subprocess.run(
             ["schtasks", "/query", "/tn", "NMRSBackup_Boot"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, creationflags=_NO_WINDOW,
         ).returncode == 0
         if daily and boot:
             return "Installed (14:00 Mon-Fri + on startup)"
@@ -824,7 +832,7 @@ def _dump_database(db_cfg, log_func) -> bytes:
             "--triggers",
             db_cfg["database"],
         ]
-        p = subprocess.run(cmd, capture_output=True)
+        p = subprocess.run(cmd, capture_output=True, creationflags=_NO_WINDOW)
         if p.returncode != 0:
             raise RuntimeError(f"mysqldump failed: {p.stderr.decode('utf-8', 'replace')[:500]}")
         return p.stdout
@@ -1492,39 +1500,116 @@ class NMRSToolkitApp:
                 return True
         return False
 
-    @classmethod
-    def _split_with_delimiters(cls, sql):
-        """Walk the script, honoring `DELIMITER xxx` directives, and return a
-        flat list of individual statements (terminator stripped, empties dropped).
+    @staticmethod
+    def _split_with_delimiters(sql):
+        """Split a SQL script into individual statements.
 
-        Inside a function/procedure body the active delimiter (typically ;;)
-        keeps the inner semicolons attached to the single CREATE statement that
-        contains them.
+        Honors `DELIMITER xxx` directives and ignores any delimiter that falls
+        inside a string literal, a backtick-quoted identifier, or a comment.
+        The scan is character-by-character rather than line-by-line because:
+          * statements may share a line (e.g. "SET @a=0;SET @b=0;"), so
+            splitting only at end-of-line ';' would merge them into one blob
+            that execute() then runs as a hidden multi-statement — breaking
+            result handling ("Commands out of sync" on the C client), and
+          * a routine body keeps its inner ';' only while a custom delimiter
+            (e.g. $$) is active.
+        Returns a flat list of statements (delimiter stripped, blanks dropped).
         """
         statements = []
-        current_delim = ";"
-        buffer = []
+        delimiter = ";"
+        buf = []
+        has_sql = False  # does buf hold anything beyond comments/whitespace?
+        i, n = 0, len(sql)
+        at_line_start = True  # only here is a DELIMITER directive recognized
 
         def flush():
-            blob = "".join(buffer).strip()
-            if not blob:
-                return
-            # Split blob on current_delim followed by whitespace/EOL/EOF.
-            pattern = re.escape(current_delim) + r"\s*(?:\r?\n|$)"
-            parts = re.split(pattern, blob)
-            for p in parts:
-                p = p.strip()
-                if p:
-                    statements.append(p)
+            # Skip comment-only / blank chunks — executing one raises 1065
+            # "Query was empty" (the file's trailing comments are the usual case).
+            nonlocal has_sql
+            if has_sql:
+                stmt = "".join(buf).strip()
+                if stmt:
+                    statements.append(stmt)
+            buf.clear()
+            has_sql = False
 
-        for line in sql.splitlines(keepends=True):
-            m = cls._DELIMITER_RE.match(line)
-            if m:
+        while i < n:
+            ch = sql[i]
+
+            # DELIMITER directive — at the start of a line, outside any quoting.
+            # Consumes the rest of the line and switches the active delimiter.
+            if (at_line_start and sql[i:i + 9].upper() == "DELIMITER"
+                    and (i + 9 >= n or sql[i + 9] in " \t")):
                 flush()
-                buffer.clear()
-                current_delim = m.group(1).strip()
+                eol = sql.find("\n", i)
+                eol = n if eol == -1 else eol
+                new_delim = sql[i + 9:eol].strip()
+                if new_delim:
+                    delimiter = new_delim
+                i = eol + 1
+                at_line_start = True
                 continue
-            buffer.append(line)
+
+            # line comment: "-- " (dash-dash + whitespace/EOL) or "#" — to EOL.
+            if ch == "#" or (sql[i:i + 2] == "--"
+                             and (i + 2 >= n or sql[i + 2] in " \t\r\n")):
+                eol = sql.find("\n", i)
+                eol = n if eol == -1 else eol
+                buf.append(sql[i:eol])
+                i = eol
+                at_line_start = False
+                continue
+
+            # block comment /* ... */ — kept verbatim. A /*! ... */ conditional
+            # comment is executable SQL (MySQL runs it), so it counts as content.
+            if sql[i:i + 2] == "/*":
+                end = sql.find("*/", i + 2)
+                end = n if end == -1 else end + 2
+                buf.append(sql[i:end])
+                if sql[i:i + 3] == "/*!":
+                    has_sql = True
+                i = end
+                at_line_start = False
+                continue
+
+            # string literal ('..','"..') or backtick-quoted identifier (`..`).
+            if ch in ("'", '"', "`"):
+                buf.append(ch)
+                i += 1
+                while i < n:
+                    c = sql[i]
+                    buf.append(c)
+                    if c == "\\" and ch != "`" and i + 1 < n:  # backslash escape
+                        buf.append(sql[i + 1])
+                        i += 2
+                        continue
+                    if c == ch:
+                        if i + 1 < n and sql[i + 1] == ch:  # doubled => escaped
+                            buf.append(sql[i + 1])
+                            i += 2
+                            continue
+                        i += 1
+                        break
+                    i += 1
+                at_line_start = False
+                has_sql = True  # a string/identifier literal is real SQL
+                continue
+
+            # active delimiter -> statement boundary.
+            if sql[i:i + len(delimiter)] == delimiter:
+                flush()
+                i += len(delimiter)
+                at_line_start = False
+                continue
+
+            buf.append(ch)
+            if ch == "\n":
+                at_line_start = True
+            elif ch not in " \t\r":
+                at_line_start = False  # whitespace keeps us "at line start"
+                has_sql = True
+            i += 1
+
         flush()
         return statements
 
@@ -2726,7 +2811,8 @@ class NMRSToolkitApp:
             target_db,
         ]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                creationflags=_NO_WINDOW)
         sent = 0
         t_in = time.monotonic()
         last_ui = 0.0
