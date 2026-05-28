@@ -1,3 +1,19 @@
+-- ---------------------------------------------------------------------------
+-- Date range for the patient-program enrolment filter below.
+--
+-- This script was authored for a templated report engine (BIRT / OpenMRS
+-- Reporting Module / similar) that substituted :startDate and :endDate before
+-- sending SQL to MySQL. mysql.connector — and MySQL itself — do not recognise
+-- :-prefixed placeholders, so we define MySQL session variables here and use
+-- @startDate / @endDate in the WHERE clause instead.
+--
+-- Defaults below = every enrolment on or before today (deliberately wide so a
+-- run never silently omits records). To bound the report to a specific period,
+-- edit the two values, e.g. @startDate = '2025-10-01' for FY26 Q1.
+-- ---------------------------------------------------------------------------
+SET @startDate = '1900-01-01';
+SET @endDate   = NOW();
+
 SELECT
    global_property.property_value as DatimCode,
    person.person_id,
@@ -186,7 +202,7 @@ completedayp(patient.patient_id) as `CompletedAYPModule`,
    LEFT JOIN patient_program pprg on(pprg.patient_id=patient.patient_id and pprg.program_id=5 and pprg.voided=0)
    WHERE patient.voided=0 
   and
-   pprg.date_enrolled BETWEEN :startDate and :endDate
+   pprg.date_enrolled BETWEEN @startDate and @endDate
 
    GROUP BY patient.patient_id;
    

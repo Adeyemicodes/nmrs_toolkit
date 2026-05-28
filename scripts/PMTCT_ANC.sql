@@ -1,6 +1,22 @@
+-- ---------------------------------------------------------------------------
+-- Date range for the encounter filter below.
+--
+-- This script was authored for a templated report engine (BIRT / OpenMRS
+-- Reporting Module / similar) that substituted :startDate and :endDate before
+-- sending SQL to MySQL. mysql.connector — and MySQL itself — do not recognise
+-- :-prefixed placeholders, so we define MySQL session variables here and use
+-- @startDate / @endDate in the WHERE clause instead.
+--
+-- Defaults below = every encounter on or before today (deliberately wide so a
+-- weekly run never silently omits records). To bound the report to a specific
+-- period, edit the two values, e.g. @startDate = '2025-10-01' for FY26 Q1.
+-- ---------------------------------------------------------------------------
+SET @startDate = '1900-01-01';
+SET @endDate   = NOW();
+
 SELECT
    global_property.property_value as DatimCode,
-   MAX(IF(obs.concept_id=165567,obs.value_text, NULL)) 
+   MAX(IF(obs.concept_id=165567,obs.value_text, NULL))
    as `ANCNo`,
    pid2.identifier as PepfarID,
    pid3.identifier as HospID,
@@ -106,6 +122,6 @@ MAX(IF(obs.concept_id=1427,DATE_FORMAT(obs.value_datetime,'%d-%b-%Y'), NULL))
    WHERE patient.voided=0 
    and enc.voided=0 and 
    enc.encounter_datetime BETWEEN
-   :startDate and :endDate
+   @startDate and @endDate
    GROUP BY patient.patient_id;
    

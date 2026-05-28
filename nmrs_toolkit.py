@@ -1231,11 +1231,11 @@ def perform_linelist_batch(config: configparser.ConfigParser, log_func=print,
         _wait_for_mysql(db, log_func)
     key = get_facility_key(config) if encrypt else None
 
-    written, failed = [], []
+    written, failed, skipped = [], [], []
     items = batch_linelists()
     if not items:
         log_func("[LINELIST] no batch linelists present under scripts/ — nothing to do")
-        return {"written": [], "failed": []}
+        return {"written": [], "failed": [], "skipped": []}
 
     log_func(f"[LINELIST] batch start: {len(items)} linelist(s), encrypt={encrypt} -> {LINELIST_DIR}")
     for display, path in items:
@@ -1243,9 +1243,16 @@ def perform_linelist_batch(config: configparser.ConfigParser, log_func=print,
         try:
             sql = path.read_text(encoding="utf-8")
             cols, rows, stmt_count = execute_sql_script(db, sql)
+            elapsed = time.monotonic() - t0
+            # Don't create an empty/headers-only file for a script that returned
+            # zero result rows. Counted as "skipped", not "failed" — the script
+            # ran fine, there was just nothing to write.
+            if not rows:
+                log_func(f"[LINELIST] {display}: 0 row(s) in {elapsed:.1f}s — no file written")
+                skipped.append(display)
+                continue
             out = _linelist_output_path(display, encrypt)
             size = write_linelist_csv(cols, rows, out, encrypt, key)
-            elapsed = time.monotonic() - t0
             log_func(f"[LINELIST] {display}: {len(rows)} row(s), {size:,} bytes in "
                      f"{elapsed:.1f}s -> {out.name}")
             written.append(out)
@@ -1253,8 +1260,9 @@ def perform_linelist_batch(config: configparser.ConfigParser, log_func=print,
             elapsed = time.monotonic() - t0
             log_func(f"[LINELIST] {display} FAILED after {elapsed:.1f}s: {e}")
             failed.append((display, str(e)))
-    log_func(f"[LINELIST] batch done: {len(written)} written, {len(failed)} failed")
-    return {"written": written, "failed": failed}
+    log_func(f"[LINELIST] batch done: {len(written)} written, "
+             f"{len(skipped)} skipped (0 rows), {len(failed)} failed")
+    return {"written": written, "failed": failed, "skipped": skipped}
 
 
 def _current_week_id(dt: datetime = None) -> str:
@@ -1739,6 +1747,17 @@ class NMRSToolkitApp:
         self.linelist_log.pack(fill="both", expand=True)
 
     def _linelist_on_source_change(self):
+        # If the user picked a bundled script from the dropdown, wipe the
+        # stale custom-file path so the UI no longer suggests the old browsed
+        # file is still in play. Index 0 is "(custom .sql file)" — leave the
+        # path alone there so the user can keep working with what they browsed.
+        # (Note: this fires only for real <<ComboboxSelected>> events; the
+        # programmatic .current(0) call inside _linelist_browse does not
+        # trigger it, so a fresh browse keeps its newly-set path.)
+        if self.linelist_bundled.current() != 0:
+            self.linelist_custom_path.config(state="normal")
+            self.linelist_custom_path.delete(0, "end")
+            self.linelist_custom_path.config(state="readonly")
         self._linelist_refresh_default_name()
 
     def _linelist_browse(self):
@@ -1847,6 +1866,19 @@ class NMRSToolkitApp:
             self.root.after(0, self._linelist_finish, False, 0, target, str(e), tb)
             return
 
+        # Skip the file write entirely when the script produced no result rows.
+        # Two cases both land here:
+        #   1) DDL-only scripts (CREATE FUNCTION/ALTER/DROP/...) that never run a
+        #      SELECT — cols and rows are both empty.
+        #   2) A SELECT that legitimately matched zero records — cols populated,
+        #      rows empty.
+        # In both cases an empty/headers-only file is misleading clutter, so we
+        # just log and report "no file written" instead of touching the disk.
+        if not rows:
+            self._post_linelist_log("Result set is empty — no output file written.")
+            self.root.after(0, self._linelist_finish, True, 0, target, None, None)
+            return
+
         # Build CSV in memory and write to disk.
         try:
             size = write_linelist_csv(
@@ -1873,6 +1905,20 @@ class NMRSToolkitApp:
         self.linelist_progress.stop()
         self.linelist_run_button.config(state="normal", bg="#1976d2")
         if success:
+            if n_rows == 0:
+                # Worker skipped the write — see the "Result set is empty" branch
+                # in _linelist_worker. Use amber, not green, to signal the run
+                # succeeded but produced nothing useful.
+                self.linelist_status.config(text="Done — 0 row(s); no file written.",
+                                            fg="#ef6c00")
+                messagebox.showinfo(
+                    "No Output",
+                    "The script ran successfully but produced no result rows.\n"
+                    "No output file was written.\n\n"
+                    "(DDL-only scripts — CREATE FUNCTION, ALTER, DROP, etc. — "
+                    "and queries that match no records both end up here.)",
+                )
+                return
             self.linelist_status.config(
                 text=f"Done — {n_rows} row(s) -> {Path(target).name}", fg="#2e7d32",
             )
@@ -1934,7 +1980,11 @@ class NMRSToolkitApp:
         self.linelist_progress.stop()
         self.linelist_run_button.config(state="normal", bg="#1976d2")
         self.linelist_batch_button.config(state="normal", bg="#2e7d32")
-        written, failed = result["written"], result["failed"]
+        written = result["written"]
+        failed = result["failed"]
+        skipped = result.get("skipped", [])  # back-compat for the early-abort dict
+        skipped_note = (f"\n\nSkipped (0 rows, no file written): {len(skipped)}\n"
+                        + "\n".join(f"• {name}" for name in skipped)) if skipped else ""
         if failed and not written:
             self.linelist_status.config(text="Batch failed.", fg="#b71c1c")
             if tb:
@@ -1942,21 +1992,27 @@ class NMRSToolkitApp:
             messagebox.showerror(
                 "Batch Failed",
                 "No linelists were generated.\n\n"
-                + "\n".join(f"• {name}: {err}" for name, err in failed))
+                + "\n".join(f"• {name}: {err}" for name, err in failed)
+                + skipped_note)
             return
         if failed:
             self.linelist_status.config(
-                text=f"Batch: {len(written)} ok, {len(failed)} failed.", fg="#ef6c00")
+                text=f"Batch: {len(written)} ok, {len(skipped)} skipped, "
+                     f"{len(failed)} failed.", fg="#ef6c00")
             messagebox.showwarning(
                 "Batch Completed With Errors",
                 f"Wrote {len(written)} linelist(s) to:\n{LINELIST_DIR}\n\n"
                 f"Failed ({len(failed)}):\n"
-                + "\n".join(f"• {name}: {err}" for name, err in failed))
+                + "\n".join(f"• {name}: {err}" for name, err in failed)
+                + skipped_note)
         else:
-            self.linelist_status.config(text=f"Batch done — {len(written)} file(s).", fg="#2e7d32")
+            tail = f" ({len(skipped)} skipped — 0 rows)" if skipped else ""
+            self.linelist_status.config(
+                text=f"Batch done — {len(written)} file(s){tail}.", fg="#2e7d32")
             messagebox.showinfo(
                 "Batch Complete",
-                f"Generated {len(written)} linelist(s) into:\n{LINELIST_DIR}")
+                f"Generated {len(written)} linelist(s) into:\n{LINELIST_DIR}"
+                + skipped_note)
 
     def open_linelist_folder(self):
         LINELIST_DIR.mkdir(parents=True, exist_ok=True)
