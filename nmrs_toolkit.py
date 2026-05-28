@@ -68,7 +68,7 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 
 
 
 APP_NAME = "NMRS Toolkit"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 # Filesystem layout for backups.
 BACKUP_DIR = Path(r"C:\NMRS_DB") if platform.system() == "Windows" else Path.home() / "NMRS_DB"
