@@ -4,8 +4,12 @@
 Single-binary GUI that ships with bundled SQL linelists, supports arbitrary .sql
 input, encrypts/decrypts CSVs with a per-facility 32-byte key from .nmrs_config.ini, merges
 multiple reports into one, and runs a daily encrypted mysqldump via the OS
-scheduler (cron on Linux, schtasks on Windows). When invoked with --backup the
-binary runs one headless backup pass and exits.
+scheduler (cron on Linux, schtasks on Windows).
+
+Headless entry points (used by the OS scheduler):
+  --backup              run one idempotent encrypted backup pass and exit.
+  --generate-linelists  generate the weekly linelist batch (Treatment, PMTCT,
+                        EAC, AHD) once per ISO week, gated to Thursday-or-later.
 """
 
 import configparser
@@ -64,11 +68,38 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 
 
 
 APP_NAME = "NMRS Toolkit"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 # Filesystem layout for backups.
 BACKUP_DIR = Path(r"C:\NMRS_DB") if platform.system() == "Windows" else Path.home() / "NMRS_DB"
 BACKUP_LOG_FILE = BACKUP_DIR / "backup.log"
+
+# Filesystem layout for generated linelists (weekly batch + manual "Generate All").
+LINELIST_DIR = (Path(r"C:\NMRS_Linelists") if platform.system() == "Windows"
+                else Path.home() / "NMRS_Linelists")
+LINELIST_LOG_FILE = LINELIST_DIR / "linelist.log"
+# Records the ISO year-week of the most recent successful weekly batch so the
+# @reboot catch-up trigger doesn't regenerate a set already produced this week.
+LINELIST_WEEK_MARKER = LINELIST_DIR / ".last_weekly_run"
+
+# Bump whenever the OS-scheduler definition changes (times, triggers, new jobs)
+# so existing installs re-register on the next launch instead of being skipped
+# by the "already installed" marker.
+SCHEDULE_VERSION = 2
+
+# Curated linelist registry — the single source of truth for what appears in the
+# Linelists dropdown and what the weekly batch generates. Tuple fields:
+#   (display_name, filename under scripts/, include_in_weekly_batch)
+# Files present in scripts/ but absent here (e.g. FAST_RADET, Last-10) are still
+# shipped in the binary but intentionally hidden from the UI. OTZ is offered for
+# manual runs but excluded from the unattended weekly batch (in_batch=False).
+LINELIST_REGISTRY = [
+    ("Treatment", "TreatmentLinelistv3_2.sql", True),
+    ("PMTCT", "PMTCT_ANC.sql", True),
+    ("EAC", "EAC Script V2.5 07-08-2025_modified.sql", True),
+    ("OTZ", "OTZLinelist.sql", False),
+    ("AHD", "AHD_SCRIPT_24TH_OCTOBER_2025.sql", True),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -188,13 +219,30 @@ def resource_path(rel: str) -> Path:
 
 
 def bundled_scripts() -> list:
-    """Return [(display_name, absolute_path), ...] for SQL files under scripts/."""
+    """Return [(display_name, absolute_path), ...] for the curated linelists in
+    LINELIST_REGISTRY that are actually present under scripts/. Order follows the
+    registry. Files in scripts/ that aren't registered are intentionally omitted."""
     scripts_dir = resource_path("scripts")
-    if not scripts_dir.exists():
-        return []
     out = []
-    for p in sorted(scripts_dir.glob("*.sql")):
-        out.append((p.stem, p))
+    for display, filename, _in_batch in LINELIST_REGISTRY:
+        p = scripts_dir / filename
+        if p.exists():
+            out.append((display, p))
+    return out
+
+
+def batch_linelists() -> list:
+    """Return [(display_name, absolute_path), ...] for the registry entries flagged
+    for the weekly batch and present under scripts/ (Treatment, PMTCT, EAC, AHD —
+    OTZ is excluded by its in_batch=False flag)."""
+    scripts_dir = resource_path("scripts")
+    out = []
+    for display, filename, in_batch in LINELIST_REGISTRY:
+        if not in_batch:
+            continue
+        p = scripts_dir / filename
+        if p.exists():
+            out.append((display, p))
     return out
 
 
@@ -377,50 +425,70 @@ def load_facility_names(config: configparser.ConfigParser) -> list:
 SCHEDULE_MARKER_FILE = Path.home() / ".nmrs_toolkit" / "schedule_installed"
 
 
-def install_backup_schedule(binary_path: Path) -> str:
-    """Register two backup triggers with the host OS scheduler:
-      - on system startup (covers machines turned on each morning)
-      - daily at 14:00 Mon-Fri (covers machines left on all week)
+def install_schedules(binary_path: Path, backup: bool = True,
+                       linelist: bool = True) -> str:
+    """Register the automated-job triggers with the host OS scheduler:
 
-    The backup itself is idempotent (skips if today's file already exists),
-    so installing both triggers does not produce duplicate backups.
+      Backup   : 00:00 Mon-Fri  + on system startup  -> --backup
+      Linelist : 00:00 Thursday + on system startup  -> --generate-linelists
 
+    Each job is idempotent (backup: at most once per day; linelist: once per
+    ISO week, gated to Thursday-or-later), so the extra on-startup trigger that
+    covers machines powered off at 00:00 never produces a duplicate run.
+
+    `backup`/`linelist` select which job sets to install (driven by config).
     Returns a human-readable description of what was installed.
     """
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    LINELIST_DIR.mkdir(parents=True, exist_ok=True)
     system = platform.system()
     binary_path = Path(binary_path).resolve()
 
     if system == "Windows":
-        # Remove any old entries first so re-install is clean.
-        for tn in ("NMRSBackup", "NMRSBackup_Boot"):
+        # Remove every NMRS task first so re-install is clean (covers renamed
+        # times and the legacy 14:00 backup task).
+        for tn in ("NMRSBackup", "NMRSBackup_Boot", "NMRSLinelist", "NMRSLinelist_Boot"):
             subprocess.run(["schtasks", "/delete", "/f", "/tn", tn],
                            capture_output=True, creationflags=_NO_WINDOW)
-        # Daily 14:00 Mon-Fri
-        subprocess.run([
-            "schtasks", "/create", "/f",
-            "/sc", "weekly",
-            "/d", "MON,TUE,WED,THU,FRI",
-            "/st", "14:00",
-            "/tn", "NMRSBackup",
-            "/tr", f'"{binary_path}" --backup',
-        ], check=True, capture_output=True, creationflags=_NO_WINDOW)
-        # On startup
-        subprocess.run([
-            "schtasks", "/create", "/f",
-            "/sc", "onstart",
-            "/tn", "NMRSBackup_Boot",
-            "/tr", f'"{binary_path}" --backup',
-        ], check=True, capture_output=True, creationflags=_NO_WINDOW)
-        return (f"Windows scheduled tasks 'NMRSBackup' (14:00 Mon-Fri) and "
-                f"'NMRSBackup_Boot' (on startup) -> {binary_path} --backup")
+        summary = []
+        if backup:
+            subprocess.run([
+                "schtasks", "/create", "/f", "/sc", "weekly",
+                "/d", "MON,TUE,WED,THU,FRI", "/st", "00:00",
+                "/tn", "NMRSBackup", "/tr", f'"{binary_path}" --backup',
+            ], check=True, capture_output=True, creationflags=_NO_WINDOW)
+            subprocess.run([
+                "schtasks", "/create", "/f", "/sc", "onstart",
+                "/tn", "NMRSBackup_Boot", "/tr", f'"{binary_path}" --backup',
+            ], check=True, capture_output=True, creationflags=_NO_WINDOW)
+            summary.append("Backup 'NMRSBackup' (00:00 Mon-Fri) + 'NMRSBackup_Boot' (on startup)")
+        if linelist:
+            subprocess.run([
+                "schtasks", "/create", "/f", "/sc", "weekly",
+                "/d", "THU", "/st", "00:00",
+                "/tn", "NMRSLinelist", "/tr", f'"{binary_path}" --generate-linelists',
+            ], check=True, capture_output=True, creationflags=_NO_WINDOW)
+            subprocess.run([
+                "schtasks", "/create", "/f", "/sc", "onstart",
+                "/tn", "NMRSLinelist_Boot", "/tr", f'"{binary_path}" --generate-linelists',
+            ], check=True, capture_output=True, creationflags=_NO_WINDOW)
+            summary.append("Linelist 'NMRSLinelist' (00:00 Thu) + 'NMRSLinelist_Boot' (on startup)")
+        return ("Windows scheduled tasks installed -> " + "; ".join(summary)) if summary \
+            else "Nothing installed (both job sets disabled in config)"
 
-    # Linux: install two cron entries, both tagged so re-install can clean
-    # up old/conflicting ones in a single pass.
-    cron_lines = [
-        f"@reboot {binary_path} --backup >> {BACKUP_LOG_FILE} 2>&1 # NMRS_TOOLKIT",
-        f"0 14 * * 1-5 {binary_path} --backup >> {BACKUP_LOG_FILE} 2>&1 # NMRS_TOOLKIT",
-    ]
+    # Linux: rebuild the # NMRS_TOOLKIT cron block in one pass (drops every stale
+    # NMRS line — including the legacy 0 14 backup — then re-adds the fresh set).
+    cron_lines = []
+    if backup:
+        cron_lines += [
+            f"@reboot {binary_path} --backup >> {BACKUP_LOG_FILE} 2>&1 # NMRS_TOOLKIT",
+            f"0 0 * * 1-5 {binary_path} --backup >> {BACKUP_LOG_FILE} 2>&1 # NMRS_TOOLKIT",
+        ]
+    if linelist:
+        cron_lines += [
+            f"@reboot {binary_path} --generate-linelists >> {LINELIST_LOG_FILE} 2>&1 # NMRS_TOOLKIT",
+            f"0 0 * * 4 {binary_path} --generate-linelists >> {LINELIST_LOG_FILE} 2>&1 # NMRS_TOOLKIT",
+        ]
     existing = subprocess.run(
         ["crontab", "-l"], capture_output=True, text=True
     )
@@ -437,35 +505,39 @@ def install_backup_schedule(binary_path: Path) -> str:
     )
     if p.returncode != 0:
         raise RuntimeError(f"crontab install failed: {p.stderr.strip() or p.stdout.strip()}")
-    return ("Linux cron entries installed:\n  " + "\n  ".join(cron_lines))
+    return ("Linux cron entries installed:\n  " + "\n  ".join(cron_lines)) if cron_lines \
+        else "Nothing installed (both job sets disabled in config)"
 
 
 def schedule_status() -> str:
-    """Return a short description of whether the schedule is installed."""
+    """Return a short description of which automated schedules are installed."""
     system = platform.system()
     if system == "Windows":
-        daily = subprocess.run(
-            ["schtasks", "/query", "/tn", "NMRSBackup"],
-            capture_output=True, text=True, creationflags=_NO_WINDOW,
-        ).returncode == 0
-        boot = subprocess.run(
-            ["schtasks", "/query", "/tn", "NMRSBackup_Boot"],
-            capture_output=True, text=True, creationflags=_NO_WINDOW,
-        ).returncode == 0
-        if daily and boot:
-            return "Installed (14:00 Mon-Fri + on startup)"
-        if daily or boot:
-            return "Partially installed — re-run Update Backup Schedule"
-        return "Not installed"
+        def _has(tn):
+            return subprocess.run(
+                ["schtasks", "/query", "/tn", tn],
+                capture_output=True, text=True, creationflags=_NO_WINDOW,
+            ).returncode == 0
+        backup_ok = _has("NMRSBackup") and _has("NMRSBackup_Boot")
+        linelist_ok = _has("NMRSLinelist") and _has("NMRSLinelist_Boot")
+        if backup_ok and linelist_ok:
+            return "Installed (backup 00:00 Mon-Fri + linelists 00:00 Thu, both + on startup)"
+        if not backup_ok and not linelist_ok:
+            return "Not installed"
+        present = ("backup" if backup_ok else "") + (" linelists" if linelist_ok else "")
+        return f"Partially installed ({present.strip()}) — re-run Update Schedules"
     p = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     if p.returncode != 0 or "# NMRS_TOOLKIT" not in p.stdout:
         return "Not installed"
     nmrs_lines = [ln for ln in p.stdout.splitlines() if "# NMRS_TOOLKIT" in ln]
-    has_reboot = any(ln.lstrip().startswith("@reboot") for ln in nmrs_lines)
-    has_daily = any(ln.lstrip().startswith("0 14") for ln in nmrs_lines)
-    if has_reboot and has_daily:
-        return "Installed (cron: 14:00 Mon-Fri + on startup)"
-    return f"Installed (legacy entries: {len(nmrs_lines)}) — re-run Update Backup Schedule"
+    has_backup = any("--backup" in ln for ln in nmrs_lines)
+    has_linelist = any("--generate-linelists" in ln for ln in nmrs_lines)
+    if has_backup and has_linelist:
+        return "Installed (cron: backup 00:00 Mon-Fri + linelists 00:00 Thu, both + on startup)"
+    if has_backup or has_linelist:
+        present = ("backup" if has_backup else "") + (" linelists" if has_linelist else "")
+        return f"Partially installed ({present.strip()}) — re-run Update Schedules"
+    return f"Installed (legacy entries: {len(nmrs_lines)}) — re-run Update Schedules"
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +981,348 @@ def run_headless_backup() -> int:
 
 
 # ---------------------------------------------------------------------------
+# SQL script execution (shared by the GUI Linelist tab and headless batch runs)
+# ---------------------------------------------------------------------------
+
+_DELIMITER_RE = re.compile(r"^\s*DELIMITER\s+(\S+)\s*$", re.IGNORECASE)
+
+
+def _has_delimiter_directive(sql) -> bool:
+    for line in sql.splitlines():
+        if _DELIMITER_RE.match(line):
+            return True
+    return False
+
+
+def _iter_result_sets(cursor, sql):
+    """Run a (possibly multi-statement) `sql` and yield each result set as an
+    object exposing .with_rows / .description / .fetchall().
+
+    Bridges a mysql-connector-python API change so the same code works whether
+    the build machine has 8.x or 9.x installed:
+      * 8.x: cursor.execute(sql, multi=True) returns a lazy iterator of
+        per-statement result cursors.
+      * 9.x: the `multi` argument was removed (passing it raises TypeError).
+        A single execute() runs every statement — MULTI_STATEMENTS is on by
+        default — and later result sets are reached via nextset().
+    """
+    try:
+        multi_iter = cursor.execute(sql, multi=True)
+    except TypeError:
+        cursor.execute(sql)
+        while True:
+            yield cursor
+            if not cursor.nextset():
+                break
+    else:
+        yield from multi_iter
+
+
+def _split_with_delimiters(sql):
+    """Split a SQL script into individual statements.
+
+    Honors `DELIMITER xxx` directives and ignores any delimiter that falls
+    inside a string literal, a backtick-quoted identifier, or a comment.
+    The scan is character-by-character rather than line-by-line because:
+      * statements may share a line (e.g. "SET @a=0;SET @b=0;"), so
+        splitting only at end-of-line ';' would merge them into one blob
+        that execute() then runs as a hidden multi-statement — breaking
+        result handling ("Commands out of sync" on the C client), and
+      * a routine body keeps its inner ';' only while a custom delimiter
+        (e.g. $$) is active.
+    Returns a flat list of statements (delimiter stripped, blanks dropped).
+    """
+    statements = []
+    delimiter = ";"
+    buf = []
+    has_sql = False  # does buf hold anything beyond comments/whitespace?
+    i, n = 0, len(sql)
+    at_line_start = True  # only here is a DELIMITER directive recognized
+
+    def flush():
+        # Skip comment-only / blank chunks — executing one raises 1065
+        # "Query was empty" (the file's trailing comments are the usual case).
+        nonlocal has_sql
+        if has_sql:
+            stmt = "".join(buf).strip()
+            if stmt:
+                statements.append(stmt)
+        buf.clear()
+        has_sql = False
+
+    while i < n:
+        ch = sql[i]
+
+        # DELIMITER directive — at the start of a line, outside any quoting.
+        # Consumes the rest of the line and switches the active delimiter.
+        if (at_line_start and sql[i:i + 9].upper() == "DELIMITER"
+                and (i + 9 >= n or sql[i + 9] in " \t")):
+            flush()
+            eol = sql.find("\n", i)
+            eol = n if eol == -1 else eol
+            new_delim = sql[i + 9:eol].strip()
+            if new_delim:
+                delimiter = new_delim
+            i = eol + 1
+            at_line_start = True
+            continue
+
+        # line comment: "-- " (dash-dash + whitespace/EOL) or "#" — to EOL.
+        if ch == "#" or (sql[i:i + 2] == "--"
+                         and (i + 2 >= n or sql[i + 2] in " \t\r\n")):
+            eol = sql.find("\n", i)
+            eol = n if eol == -1 else eol
+            buf.append(sql[i:eol])
+            i = eol
+            at_line_start = False
+            continue
+
+        # block comment /* ... */ — kept verbatim. A /*! ... */ conditional
+        # comment is executable SQL (MySQL runs it), so it counts as content.
+        if sql[i:i + 2] == "/*":
+            end = sql.find("*/", i + 2)
+            end = n if end == -1 else end + 2
+            buf.append(sql[i:end])
+            if sql[i:i + 3] == "/*!":
+                has_sql = True
+            i = end
+            at_line_start = False
+            continue
+
+        # string literal ('..','"..') or backtick-quoted identifier (`..`).
+        if ch in ("'", '"', "`"):
+            buf.append(ch)
+            i += 1
+            while i < n:
+                c = sql[i]
+                buf.append(c)
+                if c == "\\" and ch != "`" and i + 1 < n:  # backslash escape
+                    buf.append(sql[i + 1])
+                    i += 2
+                    continue
+                if c == ch:
+                    if i + 1 < n and sql[i + 1] == ch:  # doubled => escaped
+                        buf.append(sql[i + 1])
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            at_line_start = False
+            has_sql = True  # a string/identifier literal is real SQL
+            continue
+
+        # active delimiter -> statement boundary.
+        if sql[i:i + len(delimiter)] == delimiter:
+            flush()
+            i += len(delimiter)
+            at_line_start = False
+            continue
+
+        buf.append(ch)
+        if ch == "\n":
+            at_line_start = True
+        elif ch not in " \t\r":
+            at_line_start = False  # whitespace keeps us "at line start"
+            has_sql = True
+        i += 1
+
+    flush()
+    return statements
+
+
+def execute_sql_script(db_cfg, sql):
+    """Open a fresh DB connection, run `sql` (multi-statement), and return
+    (columns, rows, statement_count) for the LAST result set that produced rows.
+
+    `db_cfg` is the [database] config section (or any mapping with host/user/
+    password/database/port). See the two execution paths in _iter_result_sets /
+    _split_with_delimiters for why DELIMITER scripts are handled separately.
+    """
+    conn = db_connect(
+        host=db_cfg["host"], user=db_cfg["user"], password=db_cfg["password"],
+        database=db_cfg["database"], port=int(db_cfg.get("port", 3306)),
+        autocommit=True,
+    )
+    cols, rows, stmt_count = [], [], 0
+    try:
+        cursor = conn.cursor()
+        try:
+            if _has_delimiter_directive(sql):
+                for stmt in _split_with_delimiters(sql):
+                    stmt_count += 1
+                    cursor.execute(stmt)
+                    if cursor.with_rows:
+                        cols = [d[0] for d in cursor.description]
+                        rows = cursor.fetchall()
+            else:
+                for result in _iter_result_sets(cursor, sql):
+                    stmt_count += 1
+                    if result.with_rows:
+                        cols = [d[0] for d in result.description]
+                        rows = result.fetchall()
+        finally:
+            cursor.close()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return cols, rows, stmt_count
+
+
+def linelist_rows_to_csv_bytes(cols, rows) -> bytes:
+    """Serialize a result set to UTF-8 CSV bytes (header row + data rows)."""
+    buf = StringIO()
+    w = csv.writer(buf)
+    if cols:
+        w.writerow(cols)
+    for r in rows:
+        w.writerow(["" if v is None else str(v) for v in r])
+    return buf.getvalue().encode("utf-8")
+
+
+def write_linelist_csv(cols, rows, target: Path, encrypt: bool, key) -> int:
+    """Write a result set to `target` as plain CSV, or AES-GCM encrypted bytes
+    when encrypt=True. Returns the uncompressed payload size in bytes."""
+    payload = linelist_rows_to_csv_bytes(cols, rows)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if encrypt:
+        target.write_bytes(encrypt_bytes(payload, key))
+    else:
+        target.write_bytes(payload)
+    return len(payload)
+
+
+# ---------------------------------------------------------------------------
+# Headless weekly linelist batch (used by --generate-linelists and the
+# "Generate All Weekly Linelists" button)
+# ---------------------------------------------------------------------------
+
+def append_linelist_log(line: str) -> None:
+    LINELIST_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LINELIST_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now().isoformat(timespec='seconds')}  {line}\n")
+
+
+def _linelist_output_path(display_name: str, encrypt: bool) -> Path:
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    ext = ".csv.nmrs" if encrypt else ".csv"
+    return LINELIST_DIR / f"{display_name}_Linelist_{stamp}{ext}"
+
+
+def perform_linelist_batch(config: configparser.ConfigParser, log_func=print,
+                           encrypt=None, wait_for_mysql: bool = False) -> dict:
+    """Generate every weekly-batch linelist (Treatment, PMTCT, EAC, AHD) into
+    LINELIST_DIR. Always (re)generates — week-level idempotency is the caller's
+    job (see run_headless_linelists). Each script runs independently so one
+    failure doesn't abort the rest.
+
+    encrypt: True/False forces the mode; None reads [linelist] encrypt (default
+    false). When encrypting, output uses the facility backup key (.csv.nmrs).
+
+    Returns {"written": [Path, ...], "failed": [(display, error), ...]}.
+    """
+    LINELIST_DIR.mkdir(parents=True, exist_ok=True)
+    if encrypt is None:
+        encrypt = config.getboolean("linelist", "encrypt", fallback=False)
+    db = config["database"]
+    if wait_for_mysql:
+        _wait_for_mysql(db, log_func)
+    key = get_facility_key(config) if encrypt else None
+
+    written, failed = [], []
+    items = batch_linelists()
+    if not items:
+        log_func("[LINELIST] no batch linelists present under scripts/ — nothing to do")
+        return {"written": [], "failed": []}
+
+    log_func(f"[LINELIST] batch start: {len(items)} linelist(s), encrypt={encrypt} -> {LINELIST_DIR}")
+    for display, path in items:
+        t0 = time.monotonic()
+        try:
+            sql = path.read_text(encoding="utf-8")
+            cols, rows, stmt_count = execute_sql_script(db, sql)
+            out = _linelist_output_path(display, encrypt)
+            size = write_linelist_csv(cols, rows, out, encrypt, key)
+            elapsed = time.monotonic() - t0
+            log_func(f"[LINELIST] {display}: {len(rows)} row(s), {size:,} bytes in "
+                     f"{elapsed:.1f}s -> {out.name}")
+            written.append(out)
+        except Exception as e:
+            elapsed = time.monotonic() - t0
+            log_func(f"[LINELIST] {display} FAILED after {elapsed:.1f}s: {e}")
+            failed.append((display, str(e)))
+    log_func(f"[LINELIST] batch done: {len(written)} written, {len(failed)} failed")
+    return {"written": written, "failed": failed}
+
+
+def _current_week_id(dt: datetime = None) -> str:
+    """ISO year-week identifier, e.g. '2026-W22'."""
+    dt = dt or datetime.now()
+    iso = dt.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
+def _read_linelist_week_marker() -> str:
+    try:
+        return LINELIST_WEEK_MARKER.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _write_linelist_week_marker(week_id: str) -> None:
+    try:
+        LINELIST_DIR.mkdir(parents=True, exist_ok=True)
+        LINELIST_WEEK_MARKER.write_text(week_id, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def run_headless_linelists() -> int:
+    """Entry point for `--generate-linelists` invocation. Returns shell exit code.
+
+    Cadence: the deliverable is weekly, due Thursday 00:00. Two triggers call
+    this — a Thursday-00:00 schedule and an @reboot catch-up:
+      * If this ISO week's set is already generated, do nothing (idempotent).
+      * Before Thursday, the @reboot trigger waits — the set isn't due yet.
+      * From Thursday onward (incl. a machine that was off on Thursday and
+        first boots Friday/Saturday), generate the set and stamp the week.
+    """
+    try:
+        cfg = load_config()
+    except Exception as e:
+        sys.stderr.write(f"config load failed: {e}\n")
+        return 2
+
+    now = datetime.now()
+    week_id = _current_week_id(now)
+    iso_weekday = now.isocalendar()[2]  # Mon=1 .. Sun=7; Thursday=4
+
+    if _read_linelist_week_marker() == week_id:
+        append_linelist_log(f"[LINELIST] {week_id} already generated; skipping")
+        return 0
+    if iso_weekday < 4:
+        append_linelist_log(f"[LINELIST] before Thursday ({week_id}, weekday={iso_weekday}); "
+                            f"not yet due — skipping")
+        return 0
+
+    try:
+        result = perform_linelist_batch(cfg, log_func=append_linelist_log,
+                                        encrypt=None, wait_for_mysql=True)
+    except Exception as e:
+        append_linelist_log(f"[LINELIST] batch aborted: {e}")
+        sys.stderr.write(f"linelist batch failed: {e}\n")
+        return 1
+
+    # Stamp the week only if at least one linelist was produced, so a totally
+    # failed run (e.g. DB never came up) retries on the next trigger.
+    if result["written"]:
+        _write_linelist_week_marker(week_id)
+    return 0 if not result["failed"] else 1
+
+
+# ---------------------------------------------------------------------------
 # GUI application
 # ---------------------------------------------------------------------------
 
@@ -1193,24 +1607,38 @@ class NMRSToolkitApp:
     # -- first-launch schedule install -----------------------------------
 
     def _maybe_install_schedule_on_first_launch(self):
-        if (self.config.get("backup", "enabled", fallback="true").strip().lower()
-                not in ("true", "yes", "1")):
-            self.log("[BACKUP] backup.enabled=false in config; skipping schedule install")
+        def _on(section, key):
+            return (self.config.get(section, key, fallback="true").strip().lower()
+                    in ("true", "yes", "1"))
+        want_backup = _on("backup", "enabled")
+        want_linelist = _on("linelist", "auto_enabled")
+        if not want_backup and not want_linelist:
+            self.log("[SCHED] backup.enabled and linelist.auto_enabled both off; "
+                     "skipping schedule install")
             return
+        # Re-install when the schedule definition changed (version bump) even if a
+        # marker from an older build exists — otherwise upgrades keep the old times.
         if SCHEDULE_MARKER_FILE.exists():
-            self.log(f"[BACKUP] schedule already installed previously ({schedule_status()})")
-            return
+            try:
+                marker = SCHEDULE_MARKER_FILE.read_text(encoding="utf-8")
+            except OSError:
+                marker = ""
+            if f"schedule_version={SCHEDULE_VERSION}" in marker:
+                self.log(f"[SCHED] schedules already current ({schedule_status()})")
+                return
+            self.log("[SCHED] schedule definition changed since last install; re-registering")
         try:
             binary = Path(sys.executable if getattr(sys, "frozen", False)
                           else __file__).resolve()
-            msg = install_backup_schedule(binary)
+            msg = install_schedules(binary, backup=want_backup, linelist=want_linelist)
             SCHEDULE_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
             SCHEDULE_MARKER_FILE.write_text(
-                f"installed_at={datetime.now().isoformat()}\n{msg}\n"
+                f"installed_at={datetime.now().isoformat()}\n"
+                f"schedule_version={SCHEDULE_VERSION}\n{msg}\n"
             )
-            self.log(f"[BACKUP] scheduled: {msg}")
+            self.log(f"[SCHED] scheduled: {msg}")
         except Exception as e:
-            self.log(f"[BACKUP] schedule install failed: {e}")
+            self.log(f"[SCHED] schedule install failed: {e}")
 
     # ====================================================================
     # Linelist Runner
@@ -1272,6 +1700,25 @@ class NMRSToolkitApp:
             padx=20, pady=6, cursor="hand2",
         )
         self.linelist_run_button.pack(side="left")
+        # One-click weekly batch: Treatment, PMTCT, EAC, AHD (OTZ excluded), saved
+        # to LINELIST_DIR with auto names. Mirrors the unattended Thursday run.
+        self.linelist_batch_button = tk.Button(
+            run_frame, text="GENERATE ALL WEEKLY (4)",
+            command=self.run_linelist_batch,
+            bg="#2e7d32", fg="white", font=("Arial", 11, "bold"),
+            padx=14, pady=6, cursor="hand2",
+        )
+        self.linelist_batch_button.pack(side="left", padx=(10, 0))
+        Tooltip(
+            self.linelist_batch_button,
+            "Generates the four weekly linelists (Treatment, PMTCT, EAC, AHD) in one "
+            f"pass, saved to {LINELIST_DIR}. OTZ is excluded from the batch. Honors the "
+            "'Encrypt output' checkbox above. These also generate automatically at "
+            "00:00 every Thursday (or on the next startup if the machine was off).",
+        )
+        tk.Button(run_frame, text="Open Folder", command=self.open_linelist_folder,
+                  bg="#9e9e9e", fg="white", font=("Arial", 9, "bold"),
+                  padx=10, pady=4, cursor="hand2").pack(side="left", padx=(10, 0))
         # Indeterminate progressbar that animates while a script is running.
         # We can't show real progress because the SQL is opaque from our side,
         # but the bouncing bar makes it obvious the app didn't freeze.
@@ -1402,216 +1849,20 @@ class NMRSToolkitApp:
 
         # Build CSV in memory and write to disk.
         try:
-            buf = StringIO()
-            w = csv.writer(buf)
-            if cols:
-                w.writerow(cols)
-            for r in rows:
-                w.writerow(["" if v is None else str(v) for v in r])
-            payload = buf.getvalue().encode("utf-8")
-            if encrypt:
-                target.write_bytes(encrypt_bytes(payload, get_facility_key(self.config)))
-            else:
-                target.write_bytes(payload)
-            self._post_linelist_log(f"Wrote {len(payload):,} bytes -> {target}")
+            size = write_linelist_csv(
+                cols, rows, target, encrypt, get_facility_key(self.config) if encrypt else None)
+            self._post_linelist_log(f"Wrote {size:,} bytes -> {target}")
         except Exception as e:
             self.root.after(0, self._linelist_finish, False, 0, target, f"Write failed: {e}", None)
             return
 
         self.root.after(0, self._linelist_finish, True, len(rows), target, None, None)
 
-    _DELIMITER_RE = re.compile(r"^\s*DELIMITER\s+(\S+)\s*$", re.IGNORECASE)
-
     def _execute_script(self, sql):
-        """Open a fresh DB connection, run `sql` (multi-statement), return
-        (columns, rows, statement_count) for the LAST result set that produced rows.
-
-        Two execution paths:
-          * No DELIMITER directives -> run the whole script in one execute()
-            and walk the result sets (see _iter_result_sets; fewer round-trips).
-          * DELIMITER directives present (e.g. EAC script's CREATE FUNCTION
-            blocks) -> parse the script honoring the active delimiter per
-            segment and execute statements one at a time. DELIMITER is a CLI
-            meta-command and mysql.connector cannot process it directly.
-        """
-        db = self.config["database"]
-        conn = db_connect(
-            host=db["host"], user=db["user"], password=db["password"],
-            database=db["database"], port=int(db.get("port", 3306)),
-            autocommit=True,
-        )
-        cols, rows, stmt_count = [], [], 0
-        try:
-            cursor = conn.cursor()
-            try:
-                if self._has_delimiter_directive(sql):
-                    statements = self._split_with_delimiters(sql)
-                    for stmt in statements:
-                        stmt_count += 1
-                        cursor.execute(stmt)
-                        if cursor.with_rows:
-                            cols = [d[0] for d in cursor.description]
-                            rows = cursor.fetchall()
-                else:
-                    for result in self._iter_result_sets(cursor, sql):
-                        stmt_count += 1
-                        if result.with_rows:
-                            cols = [d[0] for d in result.description]
-                            rows = result.fetchall()
-            finally:
-                cursor.close()
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        return cols, rows, stmt_count
-
-    @staticmethod
-    def _iter_result_sets(cursor, sql):
-        """Run a (possibly multi-statement) `sql` and yield each result set as
-        an object exposing .with_rows / .description / .fetchall().
-
-        Bridges a mysql-connector-python API change so the same code works
-        whether the build machine has 8.x or 9.x installed:
-          * 8.x: cursor.execute(sql, multi=True) returns a lazy iterator of
-            per-statement result cursors.
-          * 9.x: the `multi` argument was removed (passing it raises TypeError).
-            A single execute() runs every statement — MULTI_STATEMENTS is on by
-            default — and later result sets are reached via nextset().
-        """
-        try:
-            multi_iter = cursor.execute(sql, multi=True)
-        except TypeError:
-            # 9.x — `multi` gone. execute() ran all statements; walk the results.
-            cursor.execute(sql)
-            while True:
-                yield cursor
-                if not cursor.nextset():
-                    break
-        else:
-            # 8.x — statements run lazily as we consume the iterator.
-            yield from multi_iter
-
-    @classmethod
-    def _has_delimiter_directive(cls, sql):
-        for line in sql.splitlines():
-            if cls._DELIMITER_RE.match(line):
-                return True
-        return False
-
-    @staticmethod
-    def _split_with_delimiters(sql):
-        """Split a SQL script into individual statements.
-
-        Honors `DELIMITER xxx` directives and ignores any delimiter that falls
-        inside a string literal, a backtick-quoted identifier, or a comment.
-        The scan is character-by-character rather than line-by-line because:
-          * statements may share a line (e.g. "SET @a=0;SET @b=0;"), so
-            splitting only at end-of-line ';' would merge them into one blob
-            that execute() then runs as a hidden multi-statement — breaking
-            result handling ("Commands out of sync" on the C client), and
-          * a routine body keeps its inner ';' only while a custom delimiter
-            (e.g. $$) is active.
-        Returns a flat list of statements (delimiter stripped, blanks dropped).
-        """
-        statements = []
-        delimiter = ";"
-        buf = []
-        has_sql = False  # does buf hold anything beyond comments/whitespace?
-        i, n = 0, len(sql)
-        at_line_start = True  # only here is a DELIMITER directive recognized
-
-        def flush():
-            # Skip comment-only / blank chunks — executing one raises 1065
-            # "Query was empty" (the file's trailing comments are the usual case).
-            nonlocal has_sql
-            if has_sql:
-                stmt = "".join(buf).strip()
-                if stmt:
-                    statements.append(stmt)
-            buf.clear()
-            has_sql = False
-
-        while i < n:
-            ch = sql[i]
-
-            # DELIMITER directive — at the start of a line, outside any quoting.
-            # Consumes the rest of the line and switches the active delimiter.
-            if (at_line_start and sql[i:i + 9].upper() == "DELIMITER"
-                    and (i + 9 >= n or sql[i + 9] in " \t")):
-                flush()
-                eol = sql.find("\n", i)
-                eol = n if eol == -1 else eol
-                new_delim = sql[i + 9:eol].strip()
-                if new_delim:
-                    delimiter = new_delim
-                i = eol + 1
-                at_line_start = True
-                continue
-
-            # line comment: "-- " (dash-dash + whitespace/EOL) or "#" — to EOL.
-            if ch == "#" or (sql[i:i + 2] == "--"
-                             and (i + 2 >= n or sql[i + 2] in " \t\r\n")):
-                eol = sql.find("\n", i)
-                eol = n if eol == -1 else eol
-                buf.append(sql[i:eol])
-                i = eol
-                at_line_start = False
-                continue
-
-            # block comment /* ... */ — kept verbatim. A /*! ... */ conditional
-            # comment is executable SQL (MySQL runs it), so it counts as content.
-            if sql[i:i + 2] == "/*":
-                end = sql.find("*/", i + 2)
-                end = n if end == -1 else end + 2
-                buf.append(sql[i:end])
-                if sql[i:i + 3] == "/*!":
-                    has_sql = True
-                i = end
-                at_line_start = False
-                continue
-
-            # string literal ('..','"..') or backtick-quoted identifier (`..`).
-            if ch in ("'", '"', "`"):
-                buf.append(ch)
-                i += 1
-                while i < n:
-                    c = sql[i]
-                    buf.append(c)
-                    if c == "\\" and ch != "`" and i + 1 < n:  # backslash escape
-                        buf.append(sql[i + 1])
-                        i += 2
-                        continue
-                    if c == ch:
-                        if i + 1 < n and sql[i + 1] == ch:  # doubled => escaped
-                            buf.append(sql[i + 1])
-                            i += 2
-                            continue
-                        i += 1
-                        break
-                    i += 1
-                at_line_start = False
-                has_sql = True  # a string/identifier literal is real SQL
-                continue
-
-            # active delimiter -> statement boundary.
-            if sql[i:i + len(delimiter)] == delimiter:
-                flush()
-                i += len(delimiter)
-                at_line_start = False
-                continue
-
-            buf.append(ch)
-            if ch == "\n":
-                at_line_start = True
-            elif ch not in " \t\r":
-                at_line_start = False  # whitespace keeps us "at line start"
-                has_sql = True
-            i += 1
-
-        flush()
-        return statements
+        """Run `sql` against the configured DB; return (columns, rows, stmt_count)
+        for the last result set that produced rows. Thin wrapper over the shared
+        module-level execute_sql_script()."""
+        return execute_sql_script(self.config["database"], sql)
 
     def _post_linelist_log(self, msg):
         """Marshal a log line from a worker thread back onto the UI thread."""
@@ -1635,6 +1886,89 @@ class NMRSToolkitApp:
             if tb:
                 self._ll_log("--- traceback ---\n" + tb)
             messagebox.showerror("Run Failed", error)
+
+    # -- weekly batch ("Generate All") -----------------------------------
+
+    def run_linelist_batch(self):
+        """Generate the four weekly linelists (Treatment, PMTCT, EAC, AHD) in one
+        pass into LINELIST_DIR. Encryption follows the same 'Encrypt output'
+        checkbox as a single run. Work happens on a worker thread."""
+        items = batch_linelists()
+        if not items:
+            messagebox.showwarning(
+                "Nothing to generate",
+                "No weekly batch linelists are bundled (Treatment, PMTCT, EAC, AHD).")
+            return
+        encrypt = self.linelist_encrypt_var.get()
+        names = ", ".join(d for d, _ in items)
+        if not messagebox.askyesno(
+                "Generate All Weekly Linelists",
+                f"Generate {len(items)} linelist(s) — {names} — into:\n{LINELIST_DIR}\n\n"
+                + ("Output will be ENCRYPTED (.csv.nmrs)." if encrypt
+                   else "Output will be plain CSV (.csv).")):
+            return
+
+        self.linelist_log.delete("1.0", "end")
+        self._ll_log(f"Weekly batch: {len(items)} linelist(s) -> {LINELIST_DIR}  encrypt={encrypt}")
+        self.linelist_run_button.config(state="disabled", bg="#9e9e9e")
+        self.linelist_batch_button.config(state="disabled", bg="#9e9e9e")
+        self.linelist_status.config(text="Generating batch...", fg="#1976d2")
+        self.linelist_progress.start(12)
+        threading.Thread(target=self._linelist_batch_worker, args=(encrypt,), daemon=True).start()
+
+    def _linelist_batch_worker(self, encrypt):
+        t0 = time.monotonic()
+        try:
+            result = perform_linelist_batch(
+                self.config, log_func=self._post_linelist_log, encrypt=encrypt)
+        except Exception as e:
+            tb = traceback.format_exc()
+            self._post_linelist_log(f"Batch aborted: {e}")
+            self.root.after(0, self._linelist_batch_finish, {"written": [], "failed": [("batch", str(e))]}, tb)
+            return
+        elapsed = time.monotonic() - t0
+        self._post_linelist_log(f"Batch finished in {elapsed:.1f}s")
+        self.root.after(0, self._linelist_batch_finish, result, None)
+
+    def _linelist_batch_finish(self, result, tb):
+        self.linelist_progress.stop()
+        self.linelist_run_button.config(state="normal", bg="#1976d2")
+        self.linelist_batch_button.config(state="normal", bg="#2e7d32")
+        written, failed = result["written"], result["failed"]
+        if failed and not written:
+            self.linelist_status.config(text="Batch failed.", fg="#b71c1c")
+            if tb:
+                self._ll_log("--- traceback ---\n" + tb)
+            messagebox.showerror(
+                "Batch Failed",
+                "No linelists were generated.\n\n"
+                + "\n".join(f"• {name}: {err}" for name, err in failed))
+            return
+        if failed:
+            self.linelist_status.config(
+                text=f"Batch: {len(written)} ok, {len(failed)} failed.", fg="#ef6c00")
+            messagebox.showwarning(
+                "Batch Completed With Errors",
+                f"Wrote {len(written)} linelist(s) to:\n{LINELIST_DIR}\n\n"
+                f"Failed ({len(failed)}):\n"
+                + "\n".join(f"• {name}: {err}" for name, err in failed))
+        else:
+            self.linelist_status.config(text=f"Batch done — {len(written)} file(s).", fg="#2e7d32")
+            messagebox.showinfo(
+                "Batch Complete",
+                f"Generated {len(written)} linelist(s) into:\n{LINELIST_DIR}")
+
+    def open_linelist_folder(self):
+        LINELIST_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if platform.system() == "Windows":
+                os.startfile(str(LINELIST_DIR))  # type: ignore[attr-defined]
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", str(LINELIST_DIR)])
+            else:
+                subprocess.Popen(["xdg-open", str(LINELIST_DIR)])
+        except Exception as e:
+            messagebox.showerror("Open Failed", str(e))
 
     # ====================================================================
     # Merge Reports
@@ -2280,10 +2614,11 @@ class NMRSToolkitApp:
                                               font=("Arial", 10), anchor="w")
         self.backup_schedule_label.pack(fill="x", pady=(2, 0))
         self.backup_schedule_label.config(text=f"Schedule:  {schedule_status()}")
-        tk.Label(info, text="Backups run on system startup and at 14:00 Mon-Fri "
+        tk.Label(info, text="Backups run at 00:00 Mon-Fri and on system startup "
                             "via the OS scheduler. Runs are idempotent — only one "
                             "backup per day. Files are gzip-compressed and "
-                            "AES-GCM encrypted.",
+                            "AES-GCM encrypted.  Weekly linelists are generated "
+                            "separately at 00:00 Thursday (see the Linelists tab).",
                  font=("Arial", 9), fg="#555", wraplength=860, justify="left",
                  anchor="w").pack(fill="x", pady=(6, 0))
 
@@ -2296,17 +2631,18 @@ class NMRSToolkitApp:
         )
         self.backup_run_button.pack(side="left")
         schedule_btn = tk.Button(
-            btn_row, text="Update Backup Schedule", command=self.reinstall_schedule,
+            btn_row, text="Update Schedules", command=self.reinstall_schedule,
             bg="#607d8b", fg="white", font=("Arial", 10, "bold"),
             padx=14, pady=4, cursor="hand2",
         )
         schedule_btn.pack(side="left", padx=(12, 0))
         Tooltip(
             schedule_btn,
-            "Re-registers the OS scheduler entry that runs the daily backup. "
-            "Use this if the binary path changed, the cron entry was deleted, "
-            "or the schedule time was updated. This does NOT import or restore "
-            "a database — use the Restore tab for that.",
+            "Re-registers both OS-scheduler jobs: the daily backup (00:00 Mon-Fri "
+            "+ on startup) and the weekly linelist batch (00:00 Thu + on startup). "
+            "Use this if the binary path changed, an entry was deleted, or the "
+            "schedule times were updated. This does NOT import or restore a "
+            "database — use the Restore tab for that.",
         )
         tk.Button(btn_row, text="Open Folder", command=self.open_backup_folder,
                   bg="#9e9e9e", fg="white", font=("Arial", 10, "bold"),
@@ -2391,17 +2727,22 @@ class NMRSToolkitApp:
             messagebox.showerror("Backup Failed", error)
 
     def reinstall_schedule(self):
+        def _on(section, key):
+            return (self.config.get(section, key, fallback="true").strip().lower()
+                    in ("true", "yes", "1"))
         try:
             binary = Path(sys.executable if getattr(sys, "frozen", False)
                           else __file__).resolve()
-            msg = install_backup_schedule(binary)
+            msg = install_schedules(binary, backup=_on("backup", "enabled"),
+                                    linelist=_on("linelist", "auto_enabled"))
             SCHEDULE_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
             SCHEDULE_MARKER_FILE.write_text(
-                f"installed_at={datetime.now().isoformat()}\n{msg}\n"
+                f"installed_at={datetime.now().isoformat()}\n"
+                f"schedule_version={SCHEDULE_VERSION}\n{msg}\n"
             )
-            self.log(f"[BACKUP] re-installed: {msg}")
+            self.log(f"[SCHED] re-installed: {msg}")
             self.backup_schedule_label.config(text=f"Schedule:  {schedule_status()}")
-            messagebox.showinfo("Schedule Installed", msg)
+            messagebox.showinfo("Schedules Installed", msg)
         except Exception as e:
             messagebox.showerror("Schedule Install Failed", str(e))
 
@@ -2884,8 +3225,11 @@ class NMRSToolkitApp:
 # ---------------------------------------------------------------------------
 
 def main():
-    if "--backup" in sys.argv[1:]:
+    args = sys.argv[1:]
+    if "--backup" in args:
         sys.exit(run_headless_backup())
+    if "--generate-linelists" in args:
+        sys.exit(run_headless_linelists())
     root = tk.Tk()
     NMRSToolkitApp(root)
     root.mainloop()

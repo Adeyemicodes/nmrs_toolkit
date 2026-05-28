@@ -37,6 +37,33 @@ SET @prevQ_endDate = LAST_DAY(
              INTERVAL (QUARTER(@_pq) * 3 - 1) MONTH)
 );
 
+-- ---------------------------------------------------------------------------
+-- Facility State + LGA (per-facility constants, evaluated once).
+--
+-- The historical join on nigeria_datimcode_mapping.datim_code is unreliable —
+-- the mapping table is frequently missing this facility's code, which leaves
+-- the State and LGA columns blank for every row.
+--
+-- Primary source: read them directly from the facility's own metadata.
+--   State : global_property where property='state'
+--   LGA   : location.city_village joined to the Facility_Name global_property
+--           (the WHERE on g.property pins the join to THIS facility's location
+--           row — without it, the join would match any property_value).
+--
+-- The mapping-table lookup remains as a downstream COALESCE fallback in the
+-- SELECT, so installs whose global_property values are absent/blank still get
+-- a value when the mapping table happens to know the datim_code.
+-- ---------------------------------------------------------------------------
+SET @State := (
+    SELECT property_value FROM global_property
+    WHERE property = 'state' LIMIT 1
+);
+SET @LGA := (
+    SELECT l.city_village FROM location l
+    JOIN global_property g ON g.property_value = l.name
+    WHERE g.property = 'Facility_Name' LIMIT 1
+);
+
 -- ===========================================================================
 -- MASTER TABLE A: latest obs by (person, form, concept) — current period
 -- ===========================================================================
@@ -446,8 +473,11 @@ GROUP BY o.person_id;
 -- ===========================================================================
 
 SELECT
-nigeria_datimcode_mapping.state_name                                    AS `State`,
-nigeria_datimcode_mapping.lga_name                                      AS `LGA`,
+-- Primary: per-facility @State/@LGA set near the top of this script.
+-- Fallback: legacy nigeria_datimcode_mapping lookup (kept for installs whose
+-- global_property values are blank or missing).
+COALESCE(NULLIF(TRIM(@State), ''), nigeria_datimcode_mapping.state_name)  AS `State`,
+COALESCE(NULLIF(TRIM(@LGA),   ''), nigeria_datimcode_mapping.lga_name)    AS `LGA`,
 gp_datim.property_value                                                      AS DatimCode,
 gp_facility.property_value                                                      AS FacilityName,
 pid1.identifier                                                         AS `PatientUniqueID`,

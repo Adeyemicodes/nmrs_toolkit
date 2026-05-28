@@ -9,10 +9,10 @@ Originally developed around HIV program workflows, the toolkit is being extended
 ## Features
 
 - Process Nigeria Medical Record System (NMRS) exports into structured outputs
-- Automated line list generation
-- RADET workflow support
+- Automated line list generation — 5 bundled linelists (Treatment, PMTCT, EAC, OTZ, AHD) plus any custom `.sql`
+- **Weekly linelist batch** — generates Treatment, PMTCT, EAC, and AHD in one click, or automatically at 00:00 every Thursday (and on the next startup if the machine was off); written to `~/NMRS_Linelists` (`C:\NMRS_Linelists` on Windows)
 - Configuration-driven processing via `.nmrs_config.ini`
-- **Daily encrypted database backups** — runs on system startup and at 14:00 Mon-Fri; gzip + AES-GCM per-facility key; configurable retention
+- **Daily encrypted database backups** — runs at 00:00 Mon-Fri and on system startup; gzip + AES-GCM per-facility key; configurable retention
 - **Database restore** with pre-restore safety backup, typed-name confirmation, and live byte-level progress
 - Packaged as a standalone desktop application (Ubuntu build available)
 

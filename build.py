@@ -2,19 +2,19 @@
 """
 build.py — Cross-platform build script for NMRS Toolkit.
 
-Runs PyInstaller against NMRSToolkit_v1.0.0.spec (PyInstaller's build/ and
+Runs PyInstaller against NMRSToolkit_v1.1.0.spec (PyInstaller's build/ and
 dist/ stay at the project root, which is what we want), then wraps the
 resulting binary into a shippable folder + zip under bundles/.
 
 Layout after a run:
     build/                                          (PyInstaller intermediates)
-    dist/NMRSToolkit_v1.0.0[.exe]                   (raw binary)
-    bundles/NMRSToolkit_<OS>_v1_0_0/                (shippable folder)
-        NMRSToolkit_v1.0.0[.exe]
+    dist/NMRSToolkit_v1.1.0[.exe]                   (raw binary)
+    bundles/NMRSToolkit_<OS>_v1_1_0/                (shippable folder)
+        NMRSToolkit_v1.1.0[.exe]
         README.md
         .nmrs_config.example.ini
         decrypt_nmrs_backup.py
-    bundles/NMRSToolkit_<OS>_v1_0_0.zip             (zipped folder)
+    bundles/NMRSToolkit_<OS>_v1_1_0.zip             (zipped folder)
 
 Where <OS> is one of: Ubuntu, Windows, macOS.
 
@@ -39,8 +39,8 @@ import time
 import zipfile
 from pathlib import Path
 
-APP_NAME = "NMRSToolkit_v1.0.0"
-APP_VERSION_TAG = "v1_0_0"
+APP_NAME = "NMRSToolkit_v1.1.0"
+APP_VERSION_TAG = "v1_1_0"
 SPEC_FILE = f"{APP_NAME}.spec"
 
 # Runtime imports the frozen app needs at startup. PyInstaller only bundles
@@ -187,8 +187,8 @@ def _robust_rmtree(path: Path):
             time.sleep(1.0)  # give antivirus a moment to release the handle
     sys.exit(
         f"Could not remove the previous bundle folder:\n  {path}\n  {last_err}\n\n"
-        "On Windows this means the old NMRSToolkit_v1.0.0.exe is still locked. Try:\n"
-        "  1. Close any running NMRSToolkit_v1.0.0.exe (check Task Manager).\n"
+        f"On Windows this means the old {APP_NAME}.exe is still locked. Try:\n"
+        f"  1. Close any running {APP_NAME}.exe (check Task Manager).\n"
         "  2. Close any Explorer window showing the bundles\\ folder.\n"
         "  3. Pause antivirus real-time scanning briefly, then re-run the build.\n"
         f"Or delete it manually:  rmdir /s /q {path}"

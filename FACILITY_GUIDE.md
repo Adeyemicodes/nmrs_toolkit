@@ -56,6 +56,18 @@ something doesn't work, this is the first place to look.
 That's it. If you tick the "Encrypt output" box, the saved file is locked and
 can only be opened with the toolkit — useful when sending sensitive data.
 
+### Generating the weekly set in one click
+
+If you want the four weekly linelists (Treatment, PMTCT, EAC and AHD) all at
+once, click **GENERATE ALL WEEKLY (4)** on the Linelists tab. They are saved
+automatically into a folder called **NMRS_Linelists** on the computer — click
+**Open Folder** to see them. (The "Encrypt output" box applies here too.)
+
+You don't even have to remember to do this: the app generates the same four
+linelists **by itself at midnight every Thursday** (or the next time the
+computer is switched on, if it was off). OTZ is not part of the weekly set —
+generate it on its own when you need it.
+
 ---
 
 ## Backups happen automatically
@@ -64,7 +76,7 @@ You don't have to remember to back up. The app **backs up your database by
 itself**:
 
 - Once when the computer starts for the day, and
-- Again at 2:00 PM on weekdays.
+- Again at midnight on weekdays.
 
 It only keeps one backup per day, and it automatically removes very old ones so
 your disk doesn't fill up. Backups are **encrypted**, so even if someone copies
