@@ -2,19 +2,19 @@
 """
 build.py — Cross-platform build script for NMRS Toolkit.
 
-Runs PyInstaller against NMRSToolkit_v1.1.1.spec (PyInstaller's build/ and
+Runs PyInstaller against NMRSToolkit_v1.1.2.spec (PyInstaller's build/ and
 dist/ stay at the project root, which is what we want), then wraps the
 resulting binary into a shippable folder + zip under bundles/.
 
 Layout after a run:
     build/                                          (PyInstaller intermediates)
-    dist/NMRSToolkit_v1.1.1[.exe]                   (raw binary)
-    bundles/NMRSToolkit_<OS>_v1_1_1/                (shippable folder)
-        NMRSToolkit_v1.1.1[.exe]
+    dist/NMRSToolkit_v1.1.2[.exe]                   (raw binary)
+    bundles/NMRSToolkit_<OS>_v1_1_2/                (shippable folder)
+        NMRSToolkit_v1.1.2[.exe]
         README.md
         .nmrs_config.example.ini
         decrypt_nmrs_backup.py
-    bundles/NMRSToolkit_<OS>_v1_1_1.zip             (zipped folder)
+    bundles/NMRSToolkit_<OS>_v1_1_2.zip             (zipped folder)
 
 Where <OS> is one of: Ubuntu, Windows, macOS.
 
@@ -39,8 +39,8 @@ import time
 import zipfile
 from pathlib import Path
 
-APP_NAME = "NMRSToolkit_v1.1.1"
-APP_VERSION_TAG = "v1_1_1"
+APP_NAME = "NMRSToolkit_v1.1.2"
+APP_VERSION_TAG = "v1_1_2"
 SPEC_FILE = f"{APP_NAME}.spec"
 
 # Runtime imports the frozen app needs at startup. PyInstaller only bundles

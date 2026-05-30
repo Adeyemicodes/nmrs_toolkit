@@ -68,7 +68,7 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 
 
 
 APP_NAME = "NMRS Toolkit"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 # Filesystem layout for backups.
 BACKUP_DIR = Path(r"C:\NMRS_DB") if platform.system() == "Windows" else Path.home() / "NMRS_DB"
@@ -1395,8 +1395,13 @@ class NMRSToolkitApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
-        self.root.geometry("980x900")
-        self.root.resizable(False, False)
+        # Sized for a comfortable first launch on a 1366×768 (and up) facility
+        # laptop; min size keeps every tab + the activity log usable at the
+        # smallest the user can drag the window to. Resizable in both axes —
+        # the previous resizable(False, False) was why the log got clipped
+        # whenever the chosen geometry didn't fit the host screen.
+        self.root.geometry("1150x820")
+        self.root.minsize(950, 700)
 
         self.config = None
         self.connection = None
@@ -1475,7 +1480,31 @@ class NMRSToolkitApp:
         # DB banner
         self._build_db_banner(self.root)
 
-        # Notebook
+        # Pack BOTTOM-UP so the activity log is guaranteed to be visible at any
+        # window size: pack reserves space in declaration order, so packing the
+        # log first with side="bottom" anchors it to the bottom edge with its
+        # full requested height, and the notebook then fills everything above
+        # with expand=True. (A previous attempt to use ttk.PanedWindow here
+        # hid the log entirely because weight= only governs how extra space is
+        # distributed on resize — it does NOT set the initial sash position,
+        # which Tk decides from pane reqheights. The notebook's reqheight
+        # dwarfed the log's, so the sash defaulted to the bottom edge.)
+        log_frame = tk.LabelFrame(self.root, text="Activity Log",
+                                  font=("Arial", 10, "bold"), padx=10, pady=6)
+        log_frame.pack(side="bottom", fill="x", padx=24, pady=(0, 12))
+
+        log_bar = tk.Frame(log_frame)
+        log_bar.pack(side="top", fill="x", pady=(0, 4))
+        tk.Button(log_bar, text="Clear", command=self._clear_log,
+                  bg="#9e9e9e", fg="white", font=("Arial", 8, "bold"),
+                  padx=8, pady=1, cursor="hand2").pack(side="right")
+
+        self.log_text = scrolledtext.ScrolledText(
+            log_frame, height=8, font=("Courier", 9),
+            bg="#1e1e1e", fg="#dcdcdc", insertbackground="white",
+        )
+        self.log_text.pack(fill="both", expand=True)
+
         nb_frame = tk.Frame(self.root, padx=24, pady=10)
         nb_frame.pack(fill="both", expand=True)
         self.notebook = ttk.Notebook(nb_frame)
@@ -1487,16 +1516,6 @@ class NMRSToolkitApp:
         self._safe_add_tab("Restore", self._build_restore_tab)
         if self.config.getboolean("ui", "decrypt_tab_enabled", fallback=False):
             self._safe_add_tab("Decrypt", self._build_decrypt_tab)
-
-        # Shared activity log
-        log_frame = tk.LabelFrame(self.root, text="Activity Log",
-                                  font=("Arial", 10, "bold"), padx=10, pady=8)
-        log_frame.pack(fill="both", expand=False, padx=24, pady=(0, 12))
-        self.log_text = scrolledtext.ScrolledText(
-            log_frame, height=8, font=("Courier", 9),
-            bg="#1e1e1e", fg="#dcdcdc", insertbackground="white",
-        )
-        self.log_text.pack(fill="both", expand=True)
 
         self.log(f"{APP_NAME} v{APP_VERSION} ready.")
         db = self.config["database"]
@@ -1591,6 +1610,17 @@ class NMRSToolkitApp:
             self.log_text.config(state="disabled")
         except tk.TclError:
             print(message)
+
+    def _clear_log(self):
+        """Wipe the activity log pane. Bound to the small 'Clear' button in
+        the log header — useful between runs to keep the pane focused on the
+        current task. The on-disk backup/linelist logs are untouched."""
+        try:
+            self.log_text.config(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.config(state="disabled")
+        except tk.TclError:
+            pass
 
     # -- tabs (stubs; filled in by per-feature tasks) --------------------
 

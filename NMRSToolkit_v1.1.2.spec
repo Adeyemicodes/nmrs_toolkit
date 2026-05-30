@@ -89,7 +89,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='NMRSToolkit_v1.1.1',
+    name='NMRSToolkit_v1.1.2',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
