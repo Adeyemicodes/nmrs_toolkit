@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
 
@@ -68,7 +68,7 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 
 
 
 APP_NAME = "NMRS Toolkit"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.2.0"
 
 # Filesystem layout for backups.
 BACKUP_DIR = Path(r"C:\NMRS_DB") if platform.system() == "Windows" else Path.home() / "NMRS_DB"
@@ -1514,6 +1514,10 @@ class NMRSToolkitApp:
         self._safe_add_tab("Merge Reports", self._build_merge_tab)
         self._safe_add_tab("Backup", self._build_backup_tab)
         self._safe_add_tab("Restore", self._build_restore_tab)
+        if self.config.getboolean("ui", "unvoid_tab_enabled", fallback=True):
+            self._safe_add_tab("Unvoid Patient", self._build_unvoid_tab)
+        if self.config.getboolean("ui", "reverse_tab_enabled", fallback=False):
+            self._safe_add_tab("Reverse Unvoid", self._build_reverse_tab)
         if self.config.getboolean("ui", "decrypt_tab_enabled", fallback=False):
             self._safe_add_tab("Decrypt", self._build_decrypt_tab)
 
@@ -3304,6 +3308,702 @@ class NMRSToolkitApp:
                     ui_log(f"  rows in `{sample}`: {n:,}")
         finally:
             conn.close()
+
+    # ====================================================================
+    # Unvoid Patient  (Stage 1: schema + single-client unvoid)
+    # --------------------------------------------------------------------
+    # Reverses an erroneous patient void. Safety model:
+    #   * Gate on the `patient` row's void_reason — only reasons in the
+    #     configured accepted set may be unvoided (default: the ART/DATIM
+    #     bulk-void reason plus "Duplicate Client").
+    #   * Anchor on that row's date_voided; unvoid every timestamp-bearing
+    #     table within ±window_seconds of it (default 120s). Only the most
+    #     recent void cluster is ever touched.
+    #   * Sensitive identity tables (person_name/address/attribute) often
+    #     lack a reliable date_voided, so we unvoid only their single most
+    #     recent voided row to avoid resurrecting duplicates.
+    #   * Every mutated row is logged to nmrs_unvoid_op_row with its prior
+    #     void state BEFORE the update, so the Reverse tab (Stage 2) can
+    #     re-void exactly those rows.
+    # ====================================================================
+
+    # Timestamp-windowed tables: (table, pk_column, key_column). key_column
+    # holds the patient/person id; for patients person_id == patient_id.
+    _UNVOID_WINDOW_TABLES = [
+        ("patient_identifier", "patient_identifier_id", "patient_id"),
+        ("patient_program",    "patient_program_id",    "patient_id"),
+        ("person",             "person_id",             "person_id"),
+        ("visit",              "visit_id",              "patient_id"),
+        ("encounter",          "encounter_id",          "patient_id"),
+        ("obs",                "obs_id",                "person_id"),
+    ]
+    # Sensitive identity tables: unvoid most-recent voided row only.
+    _UNVOID_IDENTITY_TABLES = [
+        ("person_name",      "person_name_id",      "person_id"),
+        ("person_address",   "person_address_id",   "person_id"),
+        ("person_attribute", "person_attribute_id", "person_id"),
+    ]
+
+    def _unvoid_accepted_reasons(self):
+        raw = self.config.get(
+            "settings", "unvoid_accepted_reasons",
+            fallback="Bulk void via ART/DATIM mapping, Duplicate Client",
+        )
+        return [r.strip() for r in raw.split(",") if r.strip()]
+
+    def _unvoid_window_seconds(self):
+        try:
+            return int(self.config.get("settings", "unvoid_window_seconds",
+                                       fallback="120"))
+        except (ValueError, TypeError):
+            return 120
+
+    # -- schema ----------------------------------------------------------
+
+    def _ensure_unvoid_schema(self, cursor):
+        """Create the reversible-audit tables if absent. CREATE TABLE is DDL
+        and auto-commits in MySQL, so call this BEFORE opening the data
+        transaction (nothing pending must be lost to the implicit commit)."""
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nmrs_unvoid_op (
+                op_id              INT AUTO_INCREMENT PRIMARY KEY,
+                op_time            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                op_type            VARCHAR(10)  NOT NULL,
+                identifier         VARCHAR(50)  NOT NULL,
+                patient_id         INT          NOT NULL,
+                patient_name       VARCHAR(255),
+                anchor_date_voided DATETIME,
+                window_seconds     INT          NOT NULL,
+                accepted_reason    VARCHAR(255),
+                executed_by        VARCHAR(100),
+                status             VARCHAR(20)  NOT NULL,
+                rows_affected      INT          NOT NULL DEFAULT 0,
+                reversed_op_id     INT          NULL,
+                remarks            TEXT,
+                INDEX idx_unvoid_op_patient (patient_id),
+                INDEX idx_unvoid_op_identifier (identifier),
+                INDEX idx_unvoid_op_time (op_time)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nmrs_unvoid_op_row (
+                row_id            INT AUTO_INCREMENT PRIMARY KEY,
+                op_id             INT          NOT NULL,
+                table_name        VARCHAR(64)  NOT NULL,
+                pk_column         VARCHAR(64)  NOT NULL,
+                pk_value          INT          NOT NULL,
+                prev_voided       TINYINT,
+                prev_date_voided  DATETIME,
+                prev_voided_by    INT,
+                prev_void_reason  VARCHAR(255),
+                INDEX idx_unvoid_row_op (op_id),
+                INDEX idx_unvoid_row_table_pk (table_name, pk_value)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+
+    # -- UI --------------------------------------------------------------
+
+    def _build_unvoid_tab(self, parent):
+        self._unvoid_batch = []    # validated patient dicts ready to unvoid
+        self._unvoid_skipped = []  # (identifier, reason) pairs
+
+        content = tk.Frame(parent, padx=20, pady=15)
+        content.pack(fill="both", expand=True)
+
+        # Step 1: identifier(s)
+        search_frame = tk.LabelFrame(
+            content, text="Step 1: Enter Patient Identifier(s)",
+            font=("Arial", 11, "bold"), padx=15, pady=15,
+        )
+        search_frame.pack(fill="x", pady=(0, 12))
+        tk.Label(search_frame,
+                 text="ART Identifier(s) — single, or comma-separated for batch "
+                      "(e.g., IMO01104166, IMO01104167):",
+                 font=("Arial", 10)).pack(anchor="w", pady=(0, 5))
+
+        entry_row = tk.Frame(search_frame)
+        entry_row.pack(fill="x")
+        self._unvoid_id_entry = tk.Entry(entry_row, font=("Arial", 12), width=50,
+                                         bd=2, relief="solid")
+        self._unvoid_id_entry.pack(side="left", padx=(0, 10))
+        self._unvoid_id_entry.bind("<Return>", lambda e: self._unvoid_validate())
+        tk.Button(entry_row, text="VALIDATE", command=self._unvoid_validate,
+                  bg="#2196F3", fg="white", font=("Arial", 11, "bold"),
+                  padx=20, pady=8, cursor="hand2").pack(side="left")
+
+        # Step 2: details
+        details_frame = tk.LabelFrame(
+            content, text="Step 2: Verify (one block per identifier)",
+            font=("Arial", 11, "bold"), padx=15, pady=15,
+        )
+        details_frame.pack(fill="both", expand=True, pady=(0, 12))
+        self._unvoid_details = scrolledtext.ScrolledText(
+            details_frame, height=16, font=("Courier", 10),
+            bg="#f5f5f5", relief="solid", bd=1,
+        )
+        self._unvoid_details.pack(fill="both", expand=True)
+        self._unvoid_details.config(state="disabled")
+
+        # Step 3: action
+        action_frame = tk.LabelFrame(
+            content, text="Step 3: Unvoid Patient Records",
+            font=("Arial", 11, "bold"), padx=15, pady=15,
+        )
+        action_frame.pack(fill="x")
+        tk.Label(action_frame,
+                 text="WARNING: unvoids records within the time window of the "
+                      "most recent void only.",
+                 font=("Arial", 9), fg="#d32f2f").pack(pady=(0, 10))
+        self._unvoid_button = tk.Button(
+            action_frame, text="UNVOID PATIENT RECORDS",
+            command=self._unvoid_confirm, bg="#cccccc", fg="#666666",
+            font=("Arial", 12, "bold"), padx=30, pady=12, cursor="hand2",
+            state="disabled", disabledforeground="#666666",
+        )
+        self._unvoid_button.pack()
+
+    def _unvoid_set_button(self, enabled):
+        if enabled:
+            self._unvoid_button.config(state="normal", bg="#f44336", fg="white")
+        else:
+            self._unvoid_button.config(state="disabled", bg="#cccccc", fg="#666666")
+
+    def _unvoid_show_details(self, text):
+        self._unvoid_details.config(state="normal")
+        self._unvoid_details.delete("1.0", tk.END)
+        self._unvoid_details.insert("1.0", text.strip())
+        self._unvoid_details.config(state="disabled")
+
+    # -- search / validate ----------------------------------------------
+
+    def _unvoid_tokenize(self, raw):
+        """Split on any common separator (comma, newline, tab, semicolon,
+        pipe, whitespace), de-duplicate, preserve order."""
+        seen = set()
+        out = []
+        for tok in re.split(r"[,\n\t;|\s]+", raw):
+            t = tok.strip()
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+
+    def _unvoid_lookup(self, cursor, identifier, accepted, window):
+        """Return (patient_dict, None) if unvoidable, else (None, skip_reason)."""
+        cursor.execute(
+            """
+            SELECT pi.patient_id, pi.identifier,
+                   CONCAT(pn.given_name, ' ', IFNULL(pn.family_name, '')) AS patient_name,
+                   p.gender, p.birthdate,
+                   pat.date_voided AS patient_date_voided,
+                   pat.void_reason AS patient_void_reason
+            FROM patient_identifier pi
+            JOIN person p   ON pi.patient_id = p.person_id
+            JOIN patient pat ON pi.patient_id = pat.patient_id
+            LEFT JOIN person_name pn ON p.person_id = pn.person_id
+            WHERE pi.identifier = %s AND pi.voided = 1
+            ORDER BY pn.preferred DESC, pn.date_created DESC
+            LIMIT 1
+            """,
+            (identifier,),
+        )
+        result = cursor.fetchone()
+        if not result:
+            cursor.execute(
+                "SELECT patient_id FROM patient_identifier "
+                "WHERE identifier = %s AND voided = 0 LIMIT 1",
+                (identifier,),
+            )
+            if cursor.fetchone():
+                return None, "already active (not voided)"
+            return None, "not found in database"
+
+        reason = result.get("patient_void_reason")
+        if reason not in accepted:
+            return None, f"void reason '{reason or 'NULL'}' not in accepted set"
+        if not result.get("patient_date_voided"):
+            return None, "no date_voided timestamp on patient row"
+
+        anchor = result["patient_date_voided"]
+        result["time_start"] = anchor - timedelta(seconds=window)
+        result["time_end"] = anchor + timedelta(seconds=window)
+        result["window_seconds"] = window
+        result["accepted_reason"] = reason
+        return result, None
+
+    def _unvoid_validate(self):
+        raw = self._unvoid_id_entry.get().strip()
+        self._unvoid_batch = []
+        self._unvoid_skipped = []
+        self._unvoid_set_button(False)
+
+        identifiers = self._unvoid_tokenize(raw)
+        if not identifiers:
+            messagebox.showwarning("Input Required",
+                                   "Please enter one or more ART identifiers.")
+            return
+
+        self.log(f"[UNVOID] Validating {len(identifiers)} identifier(s)...")
+        conn = self.get_connection()
+        if not conn:
+            return
+
+        accepted = self._unvoid_accepted_reasons()
+        window = self._unvoid_window_seconds()
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        try:
+            for ident in identifiers:
+                patient, skip = self._unvoid_lookup(cursor, ident, accepted, window)
+                if patient:
+                    self._unvoid_batch.append(patient)
+                else:
+                    self._unvoid_skipped.append((ident, skip))
+        except Error as e:
+            self.log(f"[UNVOID] Validation failed: {e}")
+            messagebox.showerror("Database Error", f"Query failed:\n\n{e}")
+            return
+        finally:
+            cursor.close()
+
+        # Build the preview.
+        blocks = []
+        for p in self._unvoid_batch:
+            blocks.append(
+                f"[READY] {p['identifier']}  (patient_id={p['patient_id']})\n"
+                f"        Name:    {p['patient_name']}\n"
+                f"        Reason:  {p['accepted_reason']}\n"
+                f"        Voided:  {p['patient_date_voided']}\n"
+                f"        Window:  {p['time_start']} .. {p['time_end']} "
+                f"(±{p['window_seconds']}s)"
+            )
+        for ident, reason in self._unvoid_skipped:
+            blocks.append(f"[SKIP]  {ident}  —  {reason}")
+
+        summary = (f"{len(self._unvoid_batch)} ready, "
+                   f"{len(self._unvoid_skipped)} skipped "
+                   f"of {len(identifiers)} identifier(s).\n"
+                   + "-" * 64 + "\n\n")
+        self._unvoid_show_details(summary + "\n\n".join(blocks))
+        self.log(f"[UNVOID] Validated: {len(self._unvoid_batch)} ready, "
+                 f"{len(self._unvoid_skipped)} skipped.")
+
+        if self._unvoid_batch:
+            n = len(self._unvoid_batch)
+            self._unvoid_button.config(
+                text=f"UNVOID {n} PATIENT{'S' if n != 1 else ''}")
+            self._unvoid_set_button(True)
+
+    # -- execute ---------------------------------------------------------
+
+    def _unvoid_confirm(self):
+        batch = self._unvoid_batch
+        if not batch:
+            return
+        names = "\n".join(f"  • {p['identifier']}  ({p['patient_name']})"
+                          for p in batch[:15])
+        more = f"\n  … and {len(batch) - 15} more" if len(batch) > 15 else ""
+        if not messagebox.askyesno(
+            "Confirm Unvoid",
+            f"Unvoid {len(batch)} patient(s)?\n\n"
+            f"{names}{more}\n\n"
+            f"Each patient is unvoided within ±{self._unvoid_window_seconds()}s "
+            f"of their most recent void, as its own logged operation.\n"
+            f"Failures are skipped, not rolled into others.\n"
+            f"This can be reversed by an administrator.\n\n"
+            f"Proceed?",
+            icon="warning",
+        ):
+            return
+        self._unvoid_execute()
+
+    def _unvoid_capture_and_clear(self, cursor, op_id, table, pk_col, where_sql, params):
+        """Capture the prior void state of every row matching `where_sql` into
+        nmrs_unvoid_op_row, then unvoid exactly those rows (by captured PK).
+        Returns the number of rows unvoided. table/pk_col are internal
+        constants (never user input), so f-string interpolation is safe."""
+        cursor.execute(
+            f"SELECT {pk_col} AS pk, voided, date_voided, voided_by, void_reason "
+            f"FROM {table} WHERE {where_sql}",
+            params,
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return 0
+        for r in rows:
+            cursor.execute(
+                "INSERT INTO nmrs_unvoid_op_row "
+                "(op_id, table_name, pk_column, pk_value, prev_voided, "
+                " prev_date_voided, prev_voided_by, prev_void_reason) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (op_id, table, pk_col, r["pk"], r["voided"],
+                 r["date_voided"], r["voided_by"], r["void_reason"]),
+            )
+        pks = [r["pk"] for r in rows]
+        placeholders = ",".join(["%s"] * len(pks))
+        cursor.execute(
+            f"UPDATE {table} SET voided = 0, voided_by = NULL, "
+            f"date_voided = NULL, void_reason = NULL "
+            f"WHERE {pk_col} IN ({placeholders})",
+            pks,
+        )
+        return cursor.rowcount
+
+    def _unvoid_one(self, conn, p, accepted, admin_name):
+        """Unvoid a single patient as its own committed transaction.
+        Returns (op_id, rows_unvoided). Raises on failure (caller rolls back)."""
+        patient_id = p["patient_id"]
+        time_start, time_end = p["time_start"], p["time_end"]
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        try:
+            cursor.execute(
+                "INSERT INTO nmrs_unvoid_op "
+                "(op_type, identifier, patient_id, patient_name, "
+                " anchor_date_voided, window_seconds, accepted_reason, "
+                " executed_by, status) "
+                "VALUES ('UNVOID', %s, %s, %s, %s, %s, %s, %s, 'IN_PROGRESS')",
+                (p["identifier"], patient_id, p["patient_name"],
+                 p["patient_date_voided"], p["window_seconds"],
+                 p["accepted_reason"], admin_name),
+            )
+            op_id = cursor.lastrowid
+            total = 0
+
+            # 1. patient table — re-check void_reason for safety.
+            ph = ",".join(["%s"] * len(accepted))
+            total += self._unvoid_capture_and_clear(
+                cursor, op_id, "patient", "patient_id",
+                f"patient_id = %s AND voided = 1 AND void_reason IN ({ph}) "
+                f"AND date_voided BETWEEN %s AND %s",
+                (patient_id, *accepted, time_start, time_end),
+            )
+
+            # 2. timestamp-windowed tables.
+            for table, pk_col, key_col in self._UNVOID_WINDOW_TABLES:
+                total += self._unvoid_capture_and_clear(
+                    cursor, op_id, table, pk_col,
+                    f"{key_col} = %s AND voided = 1 "
+                    f"AND date_voided BETWEEN %s AND %s",
+                    (patient_id, time_start, time_end),
+                )
+
+            # 3. identity tables — most recent voided row only.
+            for table, pk_col, key_col in self._UNVOID_IDENTITY_TABLES:
+                cursor.execute(
+                    f"SELECT {pk_col} AS pk FROM {table} "
+                    f"WHERE {key_col} = %s AND voided = 1 "
+                    f"ORDER BY COALESCE(date_voided, date_created) DESC LIMIT 1",
+                    (patient_id,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    total += self._unvoid_capture_and_clear(
+                        cursor, op_id, table, pk_col,
+                        f"{pk_col} = %s", (row["pk"],),
+                    )
+
+            cursor.execute(
+                "UPDATE nmrs_unvoid_op SET status = 'SUCCESS', rows_affected = %s, "
+                "remarks = %s WHERE op_id = %s",
+                (total,
+                 f"Unvoided within ±{p['window_seconds']}s of "
+                 f"{p['patient_date_voided']}; reason '{p['accepted_reason']}'.",
+                 op_id),
+            )
+            conn.commit()
+            return op_id, total
+        except Error:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+
+    def _unvoid_execute(self):
+        batch = self._unvoid_batch
+        if not batch:
+            return
+        conn = self.get_connection()
+        if not conn:
+            return
+
+        accepted = self._unvoid_accepted_reasons()
+        admin_name = self.config.get("settings", "admin_name", fallback="Administrator")
+
+        # DDL first — CREATE TABLE auto-commits, so do it before any data txn.
+        ddl_cursor = conn.cursor()
+        try:
+            self._ensure_unvoid_schema(ddl_cursor)
+        finally:
+            ddl_cursor.close()
+
+        self.log("-" * 70)
+        self.log(f"[UNVOID] START batch of {len(batch)} patient(s).")
+
+        succeeded, failed, grand_total = [], [], 0
+        for p in batch:
+            try:
+                op_id, total = self._unvoid_one(conn, p, accepted, admin_name)
+                grand_total += total
+                succeeded.append((p, op_id, total))
+                self.log(f"[UNVOID]   {p['identifier']}: op_id={op_id}, "
+                         f"{total} row(s) unvoided.")
+            except Error as e:
+                failed.append((p, str(e)))
+                self.log(f"[UNVOID]   {p['identifier']}: FAILED — {e}")
+
+        self.log(f"[UNVOID] DONE — {len(succeeded)} succeeded, {len(failed)} failed, "
+                 f"{grand_total} total row(s).")
+        self.log("-" * 70)
+
+        # Build result summary into the details pane and a dialog.
+        lines = [f"{len(succeeded)} succeeded, {len(failed)} failed "
+                 f"(of {len(batch)} attempted). {grand_total} row(s) unvoided.",
+                 "-" * 64, ""]
+        for p, op_id, total in succeeded:
+            lines.append(f"[OK]    {p['identifier']}  op_id={op_id}  "
+                         f"{total} row(s)")
+        for p, err in failed:
+            lines.append(f"[FAIL]  {p['identifier']}  —  {err}")
+        if self._unvoid_skipped:
+            lines.append("")
+            for ident, reason in self._unvoid_skipped:
+                lines.append(f"[SKIP]  {ident}  —  {reason}")
+        self._unvoid_show_details("\n".join(lines))
+
+        messagebox.showinfo(
+            "Unvoid Complete",
+            f"Succeeded: {len(succeeded)}\nFailed: {len(failed)}\n"
+            f"Skipped at validation: {len(self._unvoid_skipped)}\n\n"
+            f"Total records unvoided: {grand_total}\n\n"
+            f"These operations can be reversed by an administrator.",
+        )
+        self._unvoid_batch = []
+        self._unvoid_skipped = []
+        self._unvoid_set_button(False)
+        self._unvoid_button.config(text="UNVOID PATIENT RECORDS")
+        self._unvoid_id_entry.delete(0, tk.END)
+
+    # ====================================================================
+    # Reverse Unvoid  (Stage 2: admin-only, feature-flagged)
+    # --------------------------------------------------------------------
+    # Re-voids EXACTLY the rows a prior UNVOID operation touched, restoring
+    # each row's captured prior void state. A row that has been changed
+    # since (no longer voided=0) is skipped, never clobbered. The reverse
+    # is itself logged as a REVERSE op so it, too, is auditable.
+    # ====================================================================
+
+    def _build_reverse_tab(self, parent):
+        content = tk.Frame(parent, padx=20, pady=15)
+        content.pack(fill="both", expand=True)
+
+        tk.Label(content,
+                 text="Reverse a prior unvoid — re-voids only the exact rows it "
+                      "changed, restoring their original void state.",
+                 font=("Arial", 10), fg="#d32f2f").pack(anchor="w", pady=(0, 8))
+
+        bar = tk.Frame(content)
+        bar.pack(fill="x", pady=(0, 8))
+        tk.Button(bar, text="REFRESH", command=self._reverse_refresh,
+                  bg="#2196F3", fg="white", font=("Arial", 10, "bold"),
+                  padx=14, pady=4, cursor="hand2").pack(side="left")
+        tk.Button(bar, text="REVERSE SELECTED", command=self._reverse_selected,
+                  bg="#f44336", fg="white", font=("Arial", 10, "bold"),
+                  padx=14, pady=4, cursor="hand2").pack(side="left", padx=(8, 0))
+
+        cols = [("op_id", "Op", 60), ("op_time", "When", 150),
+                ("identifier", "Identifier", 120), ("patient_name", "Name", 200),
+                ("rows_affected", "Rows", 60),
+                ("anchor_date_voided", "Voided At", 150)]
+        tree_frame = tk.Frame(content)
+        tree_frame.pack(fill="both", expand=True)
+        self._reverse_tree = ttk.Treeview(
+            tree_frame, columns=[c[0] for c in cols], show="headings", height=14)
+        for key, label, width in cols:
+            self._reverse_tree.heading(key, text=label)
+            self._reverse_tree.column(key, width=width, anchor="w")
+        yscroll = ttk.Scrollbar(tree_frame, orient="vertical",
+                                command=self._reverse_tree.yview)
+        self._reverse_tree.configure(yscrollcommand=yscroll.set)
+        self._reverse_tree.pack(side="left", fill="both", expand=True)
+        yscroll.pack(side="right", fill="y")
+
+        self._reverse_refresh()
+
+    def _reverse_refresh(self):
+        for item in self._reverse_tree.get_children():
+            self._reverse_tree.delete(item)
+        conn = self.get_connection()
+        if not conn:
+            return
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        try:
+            self._ensure_unvoid_schema(cursor)
+            cursor.execute(
+                "SELECT op_id, op_time, identifier, patient_name, rows_affected, "
+                "       anchor_date_voided "
+                "FROM nmrs_unvoid_op "
+                "WHERE op_type = 'UNVOID' AND status = 'SUCCESS' "
+                "      AND reversed_op_id IS NULL "
+                "ORDER BY op_time DESC"
+            )
+            rows = cursor.fetchall()
+        except Error as e:
+            self.log(f"[REVERSE] Refresh failed: {e}")
+            messagebox.showerror("Database Error", f"Query failed:\n\n{e}")
+            return
+        finally:
+            cursor.close()
+
+        for r in rows:
+            self._reverse_tree.insert(
+                "", "end", iid=str(r["op_id"]),
+                values=(r["op_id"], r["op_time"], r["identifier"],
+                        r["patient_name"], r["rows_affected"],
+                        r["anchor_date_voided"]))
+        self.log(f"[REVERSE] {len(rows)} reversible operation(s).")
+
+    def _reverse_selected(self):
+        sel = self._reverse_tree.selection()
+        if not sel:
+            messagebox.showinfo("Nothing Selected",
+                                "Select an operation to reverse.")
+            return
+        try:
+            op_id = int(sel[0])
+        except ValueError:
+            return
+
+        vals = self._reverse_tree.item(sel[0], "values")
+        if not messagebox.askyesno(
+            "Confirm Reverse",
+            f"Reverse unvoid operation {op_id}?\n\n"
+            f"Identifier: {vals[2]}\n"
+            f"Name:       {vals[3]}\n"
+            f"Rows:       {vals[4]}\n\n"
+            f"This re-voids only the rows that operation unvoided, restoring "
+            f"their original void state. Rows changed since are skipped.\n\n"
+            f"Proceed?",
+            icon="warning",
+        ):
+            return
+
+        conn = self.get_connection()
+        if not conn:
+            return
+        admin_name = self.config.get("settings", "admin_name", fallback="Administrator")
+        try:
+            rev_op_id, restored, skipped = self._reverse_one(conn, op_id, admin_name)
+        except Error as e:
+            self.log(f"[REVERSE] op {op_id} FAILED — rolled back: {e}")
+            messagebox.showerror("Reverse Failed",
+                                 f"Operation failed and was rolled back:\n\n{e}")
+            return
+
+        self.log(f"[REVERSE] op {op_id} reversed by op {rev_op_id}: "
+                 f"{restored} restored, {skipped} skipped.")
+        messagebox.showinfo(
+            "Reverse Complete",
+            f"Reversed operation {op_id}.\n\n"
+            f"Restored (re-voided): {restored}\n"
+            f"Skipped (changed since): {skipped}\n\n"
+            f"Reverse operation id: {rev_op_id}",
+        )
+        self._reverse_refresh()
+
+    def _reverse_one(self, conn, orig_op_id, admin_name):
+        """Re-void exactly the rows logged for orig_op_id. Returns
+        (reverse_op_id, restored, skipped). Raises on failure (rolls back)."""
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        try:
+            cursor.execute(
+                "SELECT identifier, patient_id, patient_name, anchor_date_voided, "
+                "       window_seconds, accepted_reason, reversed_op_id "
+                "FROM nmrs_unvoid_op WHERE op_id = %s AND op_type = 'UNVOID'",
+                (orig_op_id,),
+            )
+            op = cursor.fetchone()
+            if not op:
+                raise Error(f"Unvoid operation {orig_op_id} not found.")
+            if op["reversed_op_id"] is not None:
+                raise Error(f"Operation {orig_op_id} has already been reversed "
+                            f"(by op {op['reversed_op_id']}).")
+
+            cursor.execute(
+                "SELECT table_name, pk_column, pk_value, prev_voided, "
+                "       prev_date_voided, prev_voided_by, prev_void_reason "
+                "FROM nmrs_unvoid_op_row WHERE op_id = %s",
+                (orig_op_id,),
+            )
+            detail = cursor.fetchall()
+
+            cursor.execute(
+                "INSERT INTO nmrs_unvoid_op "
+                "(op_type, identifier, patient_id, patient_name, "
+                " anchor_date_voided, window_seconds, accepted_reason, "
+                " executed_by, status, reversed_op_id) "
+                "VALUES ('REVERSE', %s, %s, %s, %s, %s, %s, %s, 'IN_PROGRESS', %s)",
+                (op["identifier"], op["patient_id"], op["patient_name"],
+                 op["anchor_date_voided"], op["window_seconds"],
+                 op["accepted_reason"], admin_name, orig_op_id),
+            )
+            rev_op_id = cursor.lastrowid
+
+            restored = skipped = 0
+            for d in detail:
+                table, pk_col, pk = d["table_name"], d["pk_column"], d["pk_value"]
+                # Capture current state for the reverse op's own audit trail.
+                cursor.execute(
+                    f"SELECT voided, date_voided, voided_by, void_reason "
+                    f"FROM {table} WHERE {pk_col} = %s",
+                    (pk,),
+                )
+                cur = cursor.fetchone()
+                if cur is None:
+                    skipped += 1
+                    continue
+                cursor.execute(
+                    "INSERT INTO nmrs_unvoid_op_row "
+                    "(op_id, table_name, pk_column, pk_value, prev_voided, "
+                    " prev_date_voided, prev_voided_by, prev_void_reason) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (rev_op_id, table, pk_col, pk, cur["voided"],
+                     cur["date_voided"], cur["voided_by"], cur["void_reason"]),
+                )
+                # Restore prior void state, but only if still unvoided (voided=0)
+                # — never clobber a row that has been changed since.
+                cursor.execute(
+                    f"UPDATE {table} SET voided = %s, date_voided = %s, "
+                    f"voided_by = %s, void_reason = %s "
+                    f"WHERE {pk_col} = %s AND voided = 0",
+                    (d["prev_voided"], d["prev_date_voided"],
+                     d["prev_voided_by"], d["prev_void_reason"], pk),
+                )
+                if cursor.rowcount:
+                    restored += 1
+                else:
+                    skipped += 1
+
+            cursor.execute(
+                "UPDATE nmrs_unvoid_op SET status = 'SUCCESS', rows_affected = %s, "
+                "remarks = %s WHERE op_id = %s",
+                (restored,
+                 f"Reversed op {orig_op_id}: {restored} re-voided, {skipped} skipped.",
+                 rev_op_id),
+            )
+            cursor.execute(
+                "UPDATE nmrs_unvoid_op SET reversed_op_id = %s WHERE op_id = %s",
+                (rev_op_id, orig_op_id),
+            )
+            conn.commit()
+            return rev_op_id, restored, skipped
+        except Error:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
 
 
 # ---------------------------------------------------------------------------

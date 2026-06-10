@@ -39,8 +39,8 @@ import time
 import zipfile
 from pathlib import Path
 
-APP_NAME = "NMRSToolkit_v1.1.2"
-APP_VERSION_TAG = "v1_1_2"
+APP_NAME = "NMRSToolkit_v1.2.0"
+APP_VERSION_TAG = "v1_2_0"
 SPEC_FILE = f"{APP_NAME}.spec"
 
 # Runtime imports the frozen app needs at startup. PyInstaller only bundles
