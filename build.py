@@ -39,8 +39,8 @@ import time
 import zipfile
 from pathlib import Path
 
-APP_NAME = "NMRSToolkit_v1.2.0"
-APP_VERSION_TAG = "v1_2_0"
+APP_NAME = "NMRSToolkit_v1.2.1"
+APP_VERSION_TAG = "v1_2_1"
 SPEC_FILE = f"{APP_NAME}.spec"
 
 # Runtime imports the frozen app needs at startup. PyInstaller only bundles
@@ -61,6 +61,11 @@ EXTRA_FILES = [
     "README.md",
     ".nmrs_config.example.ini",
     "decrypt_nmrs_backup.py",
+    # Config updater for sites upgrading from an older version (adds the new
+    # Unvoid/Reverse settings without disturbing existing credentials).
+    "update_config.sh",
+    "update_config.bat",
+    "update_config.ps1",
 ]
 
 

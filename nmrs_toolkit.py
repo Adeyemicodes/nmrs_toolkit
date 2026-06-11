@@ -68,7 +68,7 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 
 
 
 APP_NAME = "NMRS Toolkit"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 # Filesystem layout for backups.
 BACKUP_DIR = Path(r"C:\NMRS_DB") if platform.system() == "Windows" else Path.home() / "NMRS_DB"
@@ -363,7 +363,17 @@ def load_config() -> configparser.ConfigParser:
                 p = hidden
         # Move into the platform-secure location if we're not already there.
         p = _migrate_to_secure(p)
-        cfg.read(p)
+        # The config is UTF-8 (the shipped template contains em-dashes, ±, etc.).
+        # configparser.read() opens with the platform default encoding, which on
+        # Windows is cp1252 — that crashes on any multibyte UTF-8 sequence (e.g.
+        # "charmap codec can't decode byte 0x9d"). Read UTF-8 explicitly (BOM
+        # tolerated via utf-8-sig); fall back to latin-1, which decodes any byte
+        # without error, so a legacy cp1252-encoded file can never crash startup.
+        try:
+            text = p.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            text = p.read_text(encoding="latin-1")
+        cfg.read_string(text, source=str(p))
         LOADED_CONFIG_PATH = p
         _secure_config_file(p)
         return cfg
