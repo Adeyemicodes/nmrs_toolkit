@@ -51,6 +51,13 @@ export const bridge = {
     open_folder: () => call('backup_open_folder'),
     schedule_status: () => call('backup_schedule_status'),
   },
+  linelists: {
+    list_bundled: () => call('linelist_list_bundled'),
+    pick_custom: () => call('linelist_pick_custom'),
+    run: (source, outputName, encrypt) => call('linelist_run', source, outputName, !!encrypt),
+    run_weekly_batch: (encrypt) => call('linelist_run_weekly_batch', !!encrypt),
+    open_folder: () => call('linelist_open_folder'),
+  },
   restore: {
     pick_file: () => call('restore_pick_file'),
     preview: (dumpPath) => call('restore_preview', dumpPath),

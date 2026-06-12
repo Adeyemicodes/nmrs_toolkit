@@ -27,12 +27,18 @@ from .config import (
     admin_password_configured, load_config, verify_admin_password,
 )
 from .constants import (
-    APP_NAME, APP_VERSION, APPLICATION_LOG_FILE, BACKUP_DIR,
-    SCHEDULE_MARKER_FILE, SCHEDULE_VERSION, _NO_WINDOW,
+    APP_NAME, APP_VERSION, APPLICATION_LOG_FILE, BACKUP_DIR, LINELIST_DIR,
+    SCHEDULE_MARKER_FILE, SCHEDULE_VERSION, _NO_WINDOW, batch_linelists,
+    bundled_scripts,
 )
+from .crypto import get_facility_key
 from .logger import get_logger
 from .scheduler import install_schedules, schedule_status
 from .workflows.backup import append_backup_log, perform_backup
+from .workflows.linelist import (
+    append_linelist_log, execute_sql_script, perform_linelist_batch,
+    write_linelist_csv,
+)
 from .workflows.restore import append_restore_log, classify_dump, run_restore
 
 
@@ -529,3 +535,128 @@ class Api:
         self._log.emit("cancel requested — will stop after current chunk",
                        category="RESTORE", level="warn")
         return {"ok": True}
+
+    # -- linelists -------------------------------------------------------
+
+    def linelist_list_bundled(self) -> dict:
+        """Curated linelists present on disk (LINELIST_REGISTRY ∩ scripts/),
+        plus the weekly-batch count and the output directory."""
+        return {
+            "ok": True,
+            "scripts": [{"name": display, "filename": path.name}
+                        for display, path in bundled_scripts()],
+            "batch_count": len(batch_linelists()),
+            "linelist_dir": str(LINELIST_DIR),
+        }
+
+    def linelist_pick_custom(self) -> dict:
+        """Open a file-open dialog for a custom .sql script."""
+        if self._window is None:
+            return {"ok": False, "message": "No window."}
+        import webview  # lazy
+        result = self._window.create_file_dialog(
+            webview.OPEN_DIALOG, allow_multiple=False,
+            file_types=("SQL scripts (*.sql)", "All files (*.*)"))
+        if not result:
+            return {"ok": False, "cancelled": True}
+        path = result[0] if isinstance(result, (list, tuple)) else result
+        return {"ok": True, "path": str(path), "stem": Path(path).stem}
+
+    def _resolve_linelist_source(self, source: dict):
+        """Return (display_name, Path) for the selected source, or raise."""
+        if (source or {}).get("type") == "custom":
+            p = Path(source.get("path", ""))
+            if not p.exists():
+                raise FileNotFoundError(f"Custom script not found: {p}")
+            return (p.stem, p)
+        name = (source or {}).get("name", "")
+        for display, path in bundled_scripts():
+            if display == name:
+                return (display, path)
+        raise ValueError(f"Bundled script not found: {name!r}")
+
+    def linelist_run(self, source: dict, output_name: str, encrypt: bool) -> dict:
+        """Run a single linelist (bundled or custom) and write the CSV to
+        LINELIST_DIR/<output_name>. Same execution + CSV writer as v1.2.0."""
+        if self.config is None:
+            return {"ok": False, "message": self.config_error or "No configuration."}
+        try:
+            display, path = self._resolve_linelist_source(source)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": str(e)}
+        output_name = (output_name or "").strip()
+        if not output_name:
+            return {"ok": False, "message": "Output filename is required."}
+        op_id = self._next_op_id()
+        threading.Thread(target=self._linelist_worker,
+                         args=(op_id, display, path, output_name, bool(encrypt)),
+                         daemon=True).start()
+        return {"ok": True, "operation_id": op_id}
+
+    def _linelist_worker(self, op_id, display, sql_path, output_name, encrypt):
+        t0 = time.monotonic()
+        target = LINELIST_DIR / Path(output_name).name
+        append_linelist_log(f"Running '{display}' from {sql_path}")
+        append_linelist_log(f"Target: {target}  encrypt={encrypt}")
+        try:
+            sql = sql_path.read_text(encoding="utf-8")
+            cols, rows, stmt_count = execute_sql_script(self.config["database"], sql)
+            elapsed = time.monotonic() - t0
+            append_linelist_log(
+                f"Executed {stmt_count} statement(s) in {elapsed:.1f}s; "
+                f"final result set: {len(rows)} row(s), {len(cols)} column(s)")
+            # Skip the write entirely when there are no rows (legacy behavior).
+            if not rows:
+                append_linelist_log("Result set is empty — no output file written.")
+                self._push_op_event({"operation_id": op_id, "op": "linelist",
+                                     "event": "done", "ok": True, "rows": 0,
+                                     "message": "0 rows — no file written"})
+                return
+            LINELIST_DIR.mkdir(parents=True, exist_ok=True)
+            key = get_facility_key(self.config) if encrypt else None
+            size = write_linelist_csv(cols, rows, target, encrypt, key)
+            append_linelist_log(f"Wrote {size:,} bytes -> {target}")
+            self._push_op_event({"operation_id": op_id, "op": "linelist",
+                                 "event": "done", "ok": True, "rows": len(rows),
+                                 "path": str(target),
+                                 "message": f"{len(rows)} row(s) -> {target.name}"})
+        except Exception as e:  # noqa: BLE001
+            append_linelist_log(f"FAILED: {e}")
+            self._push_op_event({"operation_id": op_id, "op": "linelist",
+                                 "event": "error", "ok": False, "message": str(e)})
+
+    def linelist_run_weekly_batch(self, encrypt: bool) -> dict:
+        """Generate the weekly batch (same set as run_headless_linelists)."""
+        if self.config is None:
+            return {"ok": False, "message": self.config_error or "No configuration."}
+        if not batch_linelists():
+            return {"ok": False, "message": "No weekly batch linelists are bundled."}
+        op_id = self._next_op_id()
+        threading.Thread(target=self._linelist_batch_worker,
+                         args=(op_id, bool(encrypt)), daemon=True).start()
+        return {"ok": True, "operation_id": op_id}
+
+    def _linelist_batch_worker(self, op_id, encrypt):
+        try:
+            result = perform_linelist_batch(self.config, log_func=append_linelist_log,
+                                            encrypt=encrypt)
+            written, failed = result["written"], result["failed"]
+            skipped = result.get("skipped", [])
+            self._push_op_event({
+                "operation_id": op_id, "op": "linelist", "event": "done",
+                "ok": not (failed and not written),
+                "written": len(written), "skipped": len(skipped), "failed": len(failed),
+                "message": f"{len(written)} written, {len(skipped)} skipped, "
+                           f"{len(failed)} failed",
+            })
+        except Exception as e:  # noqa: BLE001
+            append_linelist_log(f"Batch aborted: {e}")
+            self._push_op_event({"operation_id": op_id, "op": "linelist",
+                                 "event": "error", "ok": False, "message": str(e)})
+
+    def linelist_open_folder(self) -> dict:
+        try:
+            LINELIST_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return _os_open(str(LINELIST_DIR))

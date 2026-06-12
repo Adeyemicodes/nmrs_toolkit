@@ -9,6 +9,7 @@ import { renderLogin } from './tabs/login.js';
 import { initActivityLog } from './tabs/activity-log.js';
 import { renderBackupTab } from './tabs/backup.js';
 import { renderRestoreTab } from './tabs/restore.js';
+import { renderLinelistsTab } from './tabs/linelists.js';
 
 const root = document.getElementById('root');
 
@@ -21,6 +22,7 @@ const TABS = ['Linelists', 'Merge Reports', 'Backup', 'Restore', 'Unvoid Patient
 // Tab name -> renderer. Renderers return { destroy } for cleanup on switch.
 // Tabs not yet rebuilt fall back to a placeholder.
 const TAB_RENDERERS = {
+  Linelists: renderLinelistsTab,
   Backup: renderBackupTab,
   Restore: renderRestoreTab,
 };
