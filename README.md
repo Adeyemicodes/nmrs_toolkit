@@ -30,14 +30,40 @@ Download the latest `NMRSToolkit_Ubuntu_v1_0_0.zip` from the releases, extract i
 
 ### Option 2 — From source
 
-Requirements: Python 3.x
+Requirements: Python 3.8+, and (Linux) the system GTK + WebKit2 runtime for the
+desktop window — `sudo apt install gir1.2-webkit2-4.0 python3-gi`.
 
 ```bash
 git clone https://github.com/Adeyemicodes/NMRS_Toolkit.git
 cd NMRS_Toolkit
-pip install -r requirements.txt   # if a requirements file is provided
-python nmrs_toolkit.py
+pip install -r requirements.txt
+python -m nmrs_toolkit                     # GUI
+python -m nmrs_toolkit --backup            # headless backup pass (used by cron)
+python -m nmrs_toolkit --generate-linelists  # headless weekly linelist batch
 ```
+
+## Architecture (v2)
+
+The desktop UI is an HTML/CSS/JS frontend rendered in a native **PyWebView**
+window, talking to the Python backend through a small JSON bridge. The app stays
+fully **local and offline-first**: a Content-Security-Policy blocks all network
+egress (`connect-src 'none'`), every asset is bundled, and there is no telemetry
+or auto-update. The headless `--backup` / `--generate-linelists` entry points
+import no UI code, so the OS scheduler runs them on a display-less machine.
+
+All workflows emit through a single **AppLogger**. On-disk forensic logs:
+
+| File | Contents |
+|------|----------|
+| `~/.nmrs_toolkit/application.log` | every event, all categories (rotated 10 MB × 3) |
+| `~/NMRS_DB/backup.log` | backups |
+| `~/NMRS_DB/restore.log` | restores |
+| `~/NMRS_Linelists/linelist.log` | linelist runs |
+
+(On Windows the `NMRS_DB` / `NMRS_Linelists` folders live under `C:\`.) Secrets
+(`backup_key`, `master_secret`, `admin_password`, any DB password) are redacted
+before any line is written. The in-app **Activity Log** drawer tails, filters,
+searches, and exports these logs.
 
 ## Configuration
 
@@ -93,11 +119,20 @@ This toolkit processes sensitive patient-level data. Local working folders (`RAD
 
 ## Build
 
-The application is packaged with PyInstaller using `NMRSToolkit_v1.0.0.spec`:
+Packaged with PyInstaller. The v2 spec bundles the `nmrs_toolkit/frontend/`
+assets and the pywebview GTK backend:
 
 ```bash
-pyinstaller NMRSToolkit_v1.0.0.spec
+pip install -r requirements.txt pyinstaller
+pyinstaller NMRSToolkit_v2.0.0.spec --noconfirm
+# -> dist/NMRSToolkit_v2.0.0
 ```
+
+The Linux binary loads the host's GTK + WebKit2 libraries (system packages, not
+bundled), so the target needs `libwebkit2gtk-4.0` / `gir1.2-webkit2-4.0`
+installed — standard on the facility Ubuntu machines. The `pywebview` pin in
+`requirements.txt` is chosen for WebKit2GTK 4.0 compatibility; see the comment
+there if your target ships WebKit2GTK 4.1.
 
 ## License
 

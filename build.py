@@ -39,8 +39,8 @@ import time
 import zipfile
 from pathlib import Path
 
-APP_NAME = "NMRSToolkit_v1.2.1"
-APP_VERSION_TAG = "v1_2_1"
+APP_NAME = "NMRSToolkit_v2.0.0"
+APP_VERSION_TAG = "v2_0_0"
 SPEC_FILE = f"{APP_NAME}.spec"
 
 # Runtime imports the frozen app needs at startup. PyInstaller only bundles
@@ -52,6 +52,9 @@ SPEC_FILE = f"{APP_NAME}.spec"
 REQUIRED_IMPORTS = [
     ("cryptography", "cryptography"),
     ("mysql.connector", "mysql-connector-python"),
+    ("webview", "pywebview"),
+    # tkinter backs the transitional fallback UI; gi is the GTK webview backend
+    # (Linux) — both are system packages pip can't install.
     ("tkinter", None),
 ]
 
