@@ -65,7 +65,10 @@ export function renderDecryptTab(root) {
 
   el('#dc-browse').addEventListener('click', async () => {
     const res = await bridge.decrypt.pick_file();
-    if (!res || !res.ok) return;
+    if (!res || !res.ok) {
+      if (res && !res.cancelled && res.message && window.__toast) window.__toast(res.message);
+      return;
+    }
     selected = res.path;
     el('#dc-file').textContent = res.name;
     setActions(true);

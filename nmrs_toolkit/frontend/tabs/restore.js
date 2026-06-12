@@ -104,7 +104,10 @@ export function renderRestoreTab(root) {
   // -- file picker + preview ----------------------------------------------
   el('#rs-browse').addEventListener('click', async () => {
     const res = await bridge.restore.pick_file();
-    if (!res || !res.ok) return;
+    if (!res || !res.ok) {
+      if (res && !res.cancelled && res.message && window.__toast) window.__toast(res.message);
+      return;
+    }
     selectedFile = res.path;
     const pv = await bridge.restore.preview(res.path);
     if (pv.ok) {

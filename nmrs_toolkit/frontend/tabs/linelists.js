@@ -116,7 +116,10 @@ export function renderLinelistsTab(root) {
 
   el('#ll-browse').addEventListener('click', async () => {
     const res = await bridge.linelists.pick_custom();
-    if (!res || !res.ok) return;
+    if (!res || !res.ok) {
+      if (res && !res.cancelled && res.message && window.__toast) window.__toast(res.message);
+      return;
+    }
     customPath = res.path;
     customStem = res.stem;
     el('#ll-custom-file').textContent = res.path;

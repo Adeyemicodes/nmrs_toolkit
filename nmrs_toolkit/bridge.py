@@ -466,23 +466,38 @@ class Api:
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "message": str(e)}
 
+    # -- native file dialogs --------------------------------------------
+
+    def _open_file(self, file_types, multiple=False) -> dict:
+        """Shared OPEN dialog. Returns {ok, path} (or {ok, paths} when multiple),
+        {cancelled} on dismiss, or {ok: False, message} on error — so a dialog
+        failure never silently rejects the JS promise (a dead Browse button)."""
+        if self._window is None:
+            return {"ok": False, "message": "No window."}
+        try:
+            import webview  # lazy
+            result = self._window.create_file_dialog(
+                webview.OPEN_DIALOG, allow_multiple=multiple, file_types=file_types)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"File dialog failed: {e}"}
+        if not result:
+            return {"ok": False, "cancelled": True}
+        paths = list(result) if isinstance(result, (list, tuple)) else [result]
+        if multiple:
+            return {"ok": True, "paths": [str(p) for p in paths]}
+        return {"ok": True, "path": str(paths[0])}
+
     # -- restore (highest-risk workflow) ---------------------------------
 
     def restore_pick_file(self) -> dict:
-        """Open a file-open dialog accepting the dump formats v1.2.0 accepts."""
-        if self._window is None:
-            return {"ok": False, "message": "No window."}
-        import webview  # lazy
-        file_types = (
-            "NMRS dumps (*.sql.gz.enc;*.sql.gz;*.sql.zip;*.zip;*.sql)",
-            "All files (*.*)",
-        )
-        result = self._window.create_file_dialog(
-            webview.OPEN_DIALOG, allow_multiple=False, file_types=file_types)
-        if not result:
-            return {"ok": False, "cancelled": True}
-        path = result[0] if isinstance(result, (list, tuple)) else result
-        return {"ok": True, "path": str(path)}
+        """Open a file-open dialog accepting the dump formats v1.2.0 accepts.
+
+        file_types use single-extension suffix globs (*.enc matches .sql.gz.enc):
+        pywebview's validator rejects multi-dot patterns (*.sql.gz.enc) in any
+        but the first filter entry, and rejects non-word chars in descriptions.
+        """
+        return self._open_file(
+            ("Database dumps (*.enc;*.gz;*.zip;*.sql)", "All files (*.*)"))
 
     def restore_preview(self, dump_path: str) -> dict:
         """Classify the selected dump for the Restore tab UI (format/encrypted/size)."""
@@ -586,16 +601,10 @@ class Api:
 
     def linelist_pick_custom(self) -> dict:
         """Open a file-open dialog for a custom .sql script."""
-        if self._window is None:
-            return {"ok": False, "message": "No window."}
-        import webview  # lazy
-        result = self._window.create_file_dialog(
-            webview.OPEN_DIALOG, allow_multiple=False,
-            file_types=("SQL scripts (*.sql)", "All files (*.*)"))
-        if not result:
-            return {"ok": False, "cancelled": True}
-        path = result[0] if isinstance(result, (list, tuple)) else result
-        return {"ok": True, "path": str(path), "stem": Path(path).stem}
+        res = self._open_file(("SQL scripts (*.sql)", "All files (*.*)"))
+        if res.get("ok"):
+            res["stem"] = Path(res["path"]).stem
+        return res
 
     def _resolve_linelist_source(self, source: dict):
         """Return (display_name, Path) for the selected source, or raise."""
@@ -711,16 +720,11 @@ class Api:
 
     def merge_pick_files(self) -> dict:
         """Open a multi-select file dialog for CSV / encrypted-CSV inputs."""
-        if self._window is None:
-            return {"ok": False, "message": "No window."}
-        import webview  # lazy
-        result = self._window.create_file_dialog(
-            webview.OPEN_DIALOG, allow_multiple=True,
-            file_types=("CSV / encrypted CSV (*.csv;*.csv.nmrs;*.nmrs)", "All files (*.*)"))
-        if not result:
-            return {"ok": False, "cancelled": True}
-        paths = list(result) if isinstance(result, (list, tuple)) else [result]
-        return self._validate_merge_paths(paths)
+        res = self._open_file(
+            ("CSV or encrypted CSV (*.csv;*.nmrs)", "All files (*.*)"), multiple=True)
+        if not res.get("ok"):
+            return res
+        return self._validate_merge_paths(res["paths"])
 
     def merge_add_files(self, paths) -> dict:
         """Validate paths added by drag-and-drop (where the webview exposes them)."""
@@ -956,16 +960,10 @@ class Api:
                 "placeholder": _FACILITY_PLACEHOLDER}
 
     def decrypt_pick_file(self) -> dict:
-        if self._window is None:
-            return {"ok": False, "message": "No window."}
-        import webview  # lazy
-        result = self._window.create_file_dialog(
-            webview.OPEN_DIALOG, allow_multiple=False,
-            file_types=("Encrypted (*.csv.nmrs;*.nmrs;*.sql.gz.enc)", "All files (*.*)"))
-        if not result:
-            return {"ok": False, "cancelled": True}
-        path = result[0] if isinstance(result, (list, tuple)) else result
-        return {"ok": True, "path": str(path), "name": Path(path).name}
+        res = self._open_file(("Encrypted files (*.nmrs;*.enc)", "All files (*.*)"))
+        if res.get("ok"):
+            res["name"] = Path(res["path"]).name
+        return res
 
     def _resolve_decrypt_key(self, key_hex, facility):
         """hex field -> facility-derived (master_secret) -> config backup_key."""
