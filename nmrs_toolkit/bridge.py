@@ -11,6 +11,8 @@ backup/restore/linelist/merge/unvoid/log methods.
 """
 from __future__ import annotations
 
+import csv
+import gzip
 import json
 import os
 import platform
@@ -24,14 +26,19 @@ from typing import Optional
 
 from . import config as _config_mod
 from .config import (
-    admin_password_configured, load_config, verify_admin_password,
+    admin_password_configured, get_master_secret, load_config,
+    load_facility_names, verify_admin_password,
 )
 from .constants import (
     APP_NAME, APP_VERSION, APPLICATION_LOG_FILE, BACKUP_DIR, LINELIST_DIR,
     SCHEDULE_MARKER_FILE, SCHEDULE_VERSION, _NO_WINDOW, batch_linelists,
     bundled_scripts,
 )
-from .crypto import get_facility_key
+from .crypto import (
+    CRYPTO_KEY_LEN, decrypt_bytes, derive_facility_key, get_facility_key,
+    is_encrypted_file,
+)
+from .db import db_connect
 from .logger import get_logger
 from .scheduler import install_schedules, schedule_status
 from .workflows.backup import append_backup_log, perform_backup
@@ -41,6 +48,14 @@ from .workflows.linelist import (
 )
 from .workflows.merge import append_merge_log, merge_csvs
 from .workflows.restore import append_restore_log, classify_dump, run_restore
+from .workflows.unvoid import (
+    append_unvoid_log, ensure_unvoid_schema, get_accepted_reasons,
+    get_window_seconds, lookup_patient, reverse_one, tokenize_identifiers,
+    unvoid_one,
+)
+
+DECRYPT_PREVIEW_ROWS = 200
+_FACILITY_PLACEHOLDER = "— select facility —"
 
 
 def _os_open(path: str) -> dict:
@@ -99,6 +114,8 @@ class Api:
         self._log_push_on = False
         self._op_seq = 0
         self._restore_cancels: dict = {}  # operation_id -> threading.Event
+        self._unvoid_batch: list = []     # validated patient dicts (server-side)
+        self._unvoid_skipped: list = []
         self.config = None
         self.config_error: Optional[str] = None
         # Restart survival: seed the ring buffer from APPLICATION_LOG_FILE so the
@@ -220,7 +237,24 @@ class Api:
             "db_name": db.get("database", "?"),
             "user": db.get("user", "?"),
             "config_path": str(_config_mod.LOADED_CONFIG_PATH or ""),
+            "ui_flags": self._ui_flags(),
         }
+
+    def _ui_flags(self) -> dict:
+        """Config-gated tab visibility (preserves the legacy defaults)."""
+        if self.config is None:
+            return {"unvoid": False, "reverse": False, "decrypt": False}
+        g = self.config.getboolean
+        return {
+            "unvoid": g("ui", "unvoid_tab_enabled", fallback=True),
+            "reverse": g("ui", "reverse_tab_enabled", fallback=False),
+            "decrypt": g("ui", "decrypt_tab_enabled", fallback=False),
+        }
+
+    def _connect(self):
+        db = self.config["database"]
+        return db_connect(host=db["host"], user=db["user"], password=db["password"],
+                          database=db["database"], port=int(db.get("port", 3306)))
 
     # -- activity log ----------------------------------------------------
 
@@ -737,3 +771,287 @@ class Api:
             append_merge_log(f"FAILED: {e}")
             self._push_op_event({"operation_id": op_id, "op": "merge",
                                  "event": "error", "ok": False, "message": str(e)})
+
+    # -- unvoid patient (high-stakes; audited + reversible) --------------
+
+    def unvoid_validate(self, identifiers: str) -> dict:
+        """Look up each ART identifier and classify as ready / skipped. Stores
+        the validated batch server-side so commit uses the exact validated data
+        (no patient state round-trips through JS)."""
+        if self.config is None:
+            return {"ok": False, "message": self.config_error or "No configuration."}
+        idents = tokenize_identifiers(identifiers)
+        if not idents:
+            return {"ok": False, "message": "Enter one or more ART identifiers."}
+        accepted = get_accepted_reasons(self.config)
+        window = get_window_seconds(self.config)
+        self._unvoid_batch = []
+        self._unvoid_skipped = []
+        append_unvoid_log(f"Validating {len(idents)} identifier(s)...")
+        try:
+            conn = self._connect()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"DB connection failed: {e}"}
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        try:
+            for ident in idents:
+                patient, skip = lookup_patient(cursor, ident, accepted, window)
+                if patient:
+                    self._unvoid_batch.append(patient)
+                else:
+                    self._unvoid_skipped.append((ident, skip))
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"Query failed: {e}"}
+        finally:
+            cursor.close()
+            conn.close()
+        ready = [{
+            "identifier": p["identifier"],
+            "patient_id": p["patient_id"],
+            "patient_name": p["patient_name"],
+            "accepted_reason": p["accepted_reason"],
+            "date_voided": str(p["patient_date_voided"]),
+            "window_start": str(p["time_start"]),
+            "window_end": str(p["time_end"]),
+            "window_seconds": p["window_seconds"],
+        } for p in self._unvoid_batch]
+        append_unvoid_log(f"Validated: {len(ready)} ready, "
+                          f"{len(self._unvoid_skipped)} skipped.")
+        return {
+            "ok": True,
+            "ready": ready,
+            "skipped": [{"identifier": i, "reason": r} for i, r in self._unvoid_skipped],
+            "total": len(idents),
+        }
+
+    def unvoid_commit(self) -> dict:
+        """Execute the validated batch (each patient as its own committed txn)."""
+        if self.config is None:
+            return {"ok": False, "message": self.config_error or "No configuration."}
+        if not self._unvoid_batch:
+            return {"ok": False, "message": "Nothing validated to unvoid."}
+        op_id = self._next_op_id()
+        batch = self._unvoid_batch
+        self._unvoid_batch = []  # consume so it can't be double-committed
+        threading.Thread(target=self._unvoid_worker, args=(op_id, batch),
+                         daemon=True).start()
+        return {"ok": True, "operation_id": op_id, "count": len(batch)}
+
+    def _unvoid_worker(self, op_id, batch):
+        accepted = get_accepted_reasons(self.config)
+        admin_name = self.config.get("settings", "admin_name", fallback="Administrator")
+        try:
+            conn = self._connect()
+        except Exception as e:  # noqa: BLE001
+            self._push_op_event({"operation_id": op_id, "op": "unvoid",
+                                 "event": "error", "ok": False,
+                                 "message": f"DB connection failed: {e}"})
+            return
+        try:
+            ddl = conn.cursor()
+            try:
+                ensure_unvoid_schema(ddl)
+            finally:
+                ddl.close()
+            append_unvoid_log(f"START batch of {len(batch)} patient(s)")
+            succeeded, failed, grand_total = 0, 0, 0
+            for p in batch:
+                try:
+                    uid, total = unvoid_one(conn, p, accepted, admin_name)
+                    grand_total += total
+                    succeeded += 1
+                    append_unvoid_log(f"{p['identifier']}: op_id={uid}, {total} row(s) unvoided")
+                except Exception as e:  # noqa: BLE001
+                    failed += 1
+                    append_unvoid_log(f"{p['identifier']}: FAILED — {e}")
+            append_unvoid_log(f"DONE — {succeeded} succeeded, {failed} failed, "
+                              f"{grand_total} total row(s)")
+            self._push_op_event({
+                "operation_id": op_id, "op": "unvoid", "event": "done",
+                "ok": failed == 0, "succeeded": succeeded, "failed": failed,
+                "rows": grand_total,
+                "message": f"{succeeded} succeeded, {failed} failed, {grand_total} row(s) unvoided",
+            })
+        finally:
+            conn.close()
+
+    # -- reverse unvoid (config-gated) ----------------------------------
+
+    def reverse_list(self) -> dict:
+        """Reversible UNVOID operations (SUCCESS, not yet reversed)."""
+        if self.config is None:
+            return {"ok": False, "message": self.config_error or "No configuration."}
+        try:
+            conn = self._connect()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"DB connection failed: {e}"}
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        try:
+            ensure_unvoid_schema(cursor)
+            cursor.execute(
+                "SELECT op_id, op_time, identifier, patient_name, rows_affected, "
+                "       anchor_date_voided "
+                "FROM nmrs_unvoid_op "
+                "WHERE op_type = 'UNVOID' AND status = 'SUCCESS' "
+                "      AND reversed_op_id IS NULL "
+                "ORDER BY op_time DESC")
+            rows = cursor.fetchall()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"Query failed: {e}"}
+        finally:
+            cursor.close()
+            conn.close()
+        return {"ok": True, "operations": [{
+            "op_id": r["op_id"], "op_time": str(r["op_time"]),
+            "identifier": r["identifier"], "patient_name": r["patient_name"],
+            "rows_affected": r["rows_affected"],
+            "anchor_date_voided": str(r["anchor_date_voided"]),
+        } for r in rows]}
+
+    def reverse_run(self, op_id: int) -> dict:
+        if self.config is None:
+            return {"ok": False, "message": self.config_error or "No configuration."}
+        try:
+            orig = int(op_id)
+        except (ValueError, TypeError):
+            return {"ok": False, "message": "Invalid operation id."}
+        operation_id = self._next_op_id()
+        threading.Thread(target=self._reverse_worker, args=(operation_id, orig),
+                         daemon=True).start()
+        return {"ok": True, "operation_id": operation_id}
+
+    def _reverse_worker(self, operation_id, orig_op_id):
+        admin_name = self.config.get("settings", "admin_name", fallback="Administrator")
+        try:
+            conn = self._connect()
+        except Exception as e:  # noqa: BLE001
+            self._push_op_event({"operation_id": operation_id, "op": "reverse",
+                                 "event": "error", "ok": False,
+                                 "message": f"DB connection failed: {e}"})
+            return
+        try:
+            rev_op_id, restored, skipped = reverse_one(conn, orig_op_id, admin_name)
+            append_unvoid_log(f"op {orig_op_id} reversed by op {rev_op_id}: "
+                              f"{restored} restored, {skipped} skipped")
+            self._push_op_event({
+                "operation_id": operation_id, "op": "reverse", "event": "done",
+                "ok": True, "reverse_op_id": rev_op_id, "restored": restored,
+                "skipped": skipped,
+                "message": f"op {orig_op_id} reversed: {restored} re-voided, {skipped} skipped",
+            })
+        except Exception as e:  # noqa: BLE001
+            append_unvoid_log(f"op {orig_op_id} FAILED — rolled back: {e}")
+            self._push_op_event({"operation_id": operation_id, "op": "reverse",
+                                 "event": "error", "ok": False, "message": str(e)})
+        finally:
+            conn.close()
+
+    # -- decrypt (config-gated) -----------------------------------------
+
+    def decrypt_list_facilities(self) -> dict:
+        if self.config is None:
+            return {"ok": False, "message": self.config_error or "No configuration."}
+        return {"ok": True, "facilities": load_facility_names(self.config),
+                "has_master": bool(get_master_secret(self.config)),
+                "placeholder": _FACILITY_PLACEHOLDER}
+
+    def decrypt_pick_file(self) -> dict:
+        if self._window is None:
+            return {"ok": False, "message": "No window."}
+        import webview  # lazy
+        result = self._window.create_file_dialog(
+            webview.OPEN_DIALOG, allow_multiple=False,
+            file_types=("Encrypted (*.csv.nmrs;*.nmrs;*.sql.gz.enc)", "All files (*.*)"))
+        if not result:
+            return {"ok": False, "cancelled": True}
+        path = result[0] if isinstance(result, (list, tuple)) else result
+        return {"ok": True, "path": str(path), "name": Path(path).name}
+
+    def _resolve_decrypt_key(self, key_hex, facility):
+        """hex field -> facility-derived (master_secret) -> config backup_key."""
+        hex_field = (key_hex or "").strip()
+        if hex_field:
+            try:
+                k = bytes.fromhex(hex_field)
+            except ValueError as e:
+                raise ValueError(f"Backup key field is not valid hex: {e}")
+            if len(k) != CRYPTO_KEY_LEN:
+                raise ValueError(f"Backup key must be {CRYPTO_KEY_LEN * 2} hex chars "
+                                 f"({CRYPTO_KEY_LEN} bytes); got {len(k)} bytes")
+            return k
+        chosen = (facility or "").strip()
+        if chosen and chosen != _FACILITY_PLACEHOLDER:
+            master = get_master_secret(self.config)
+            if not master:
+                raise RuntimeError("Facility selected but no master_secret is configured.")
+            return derive_facility_key(master, chosen)
+        return get_facility_key(self.config)
+
+    def _decrypt_bytes_from(self, path: str, key_hex, facility):
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"File not found: {p}")
+        if not is_encrypted_file(p):
+            raise ValueError("This file doesn't have the NMRS encryption header.")
+        return decrypt_bytes(p.read_bytes(), self._resolve_decrypt_key(key_hex, facility))
+
+    def decrypt_preview(self, path: str, key_hex: str = "", facility: str = "") -> dict:
+        try:
+            raw = self._decrypt_bytes_from(path, key_hex, facility)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": str(e)}
+        if str(path).lower().endswith(".sql.gz.enc"):
+            try:
+                sql_bytes = gzip.decompress(raw)
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "message": f"Decrypted OK but gunzip failed: {e}"}
+            head = sql_bytes[:8192].decode("utf-8", errors="replace")
+            self._log.emit(f"previewed SQL dump from {path}", category="UI")
+            return {"ok": True, "kind": "sql", "size": len(sql_bytes), "head": head}
+        text = raw.decode("utf-8", errors="replace")
+        reader = csv.reader(text.splitlines())
+        try:
+            headers = next(reader)
+        except StopIteration:
+            return {"ok": True, "kind": "csv", "headers": [], "rows": [], "total": 0}
+        rows, total = [], 0
+        for row in reader:
+            total += 1
+            if len(rows) < DECRYPT_PREVIEW_ROWS:
+                vals = list(row[:len(headers)])
+                vals += [""] * (len(headers) - len(vals))
+                rows.append(vals)
+        self._log.emit(f"previewed {total} row(s) from {path}", category="UI")
+        return {"ok": True, "kind": "csv", "headers": headers, "rows": rows,
+                "total": total, "shown": len(rows)}
+
+    def decrypt_save(self, path: str, key_hex: str = "", facility: str = "") -> dict:
+        if self._window is None:
+            return {"ok": False, "message": "No window."}
+        try:
+            raw = self._decrypt_bytes_from(path, key_hex, facility)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": str(e)}
+        import webview  # lazy
+        name = Path(path).name
+        if str(path).lower().endswith(".sql.gz.enc"):
+            try:
+                out_bytes = gzip.decompress(raw)
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "message": f"gunzip failed: {e}"}
+            default = name[:-len(".gz.enc")] if name.endswith(".sql.gz.enc") else name + ".sql"
+        else:
+            out_bytes = raw
+            if name.endswith(".csv.nmrs"):
+                default = name[:-len(".nmrs")]
+            elif name.endswith(".nmrs"):
+                default = name[:-len(".nmrs")] + ".csv"
+            else:
+                default = name + ".csv"
+        result = self._window.create_file_dialog(webview.SAVE_DIALOG, save_filename=default)
+        if not result:
+            return {"ok": False, "cancelled": True}
+        target = result[0] if isinstance(result, (list, tuple)) else result
+        Path(target).write_bytes(out_bytes)
+        self._log.emit(f"wrote plaintext -> {target}", category="UI")
+        return {"ok": True, "path": str(target), "bytes": len(out_bytes)}

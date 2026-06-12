@@ -11,6 +11,9 @@ import { renderBackupTab } from './tabs/backup.js';
 import { renderRestoreTab } from './tabs/restore.js';
 import { renderLinelistsTab } from './tabs/linelists.js';
 import { renderMergeTab } from './tabs/merge.js';
+import { renderUnvoidTab } from './tabs/unvoid.js';
+import { renderReverseTab } from './tabs/reverse-unvoid.js';
+import { renderDecryptTab } from './tabs/decrypt.js';
 
 const root = document.getElementById('root');
 
@@ -18,20 +21,33 @@ const esc = (s) =>
   String(s).replace(/[&<>"]/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-const TABS = ['Linelists', 'Merge Reports', 'Backup', 'Restore', 'Unvoid Patient'];
+// The four always-on tabs; the rest are config-gated (see ui_flags).
+const BASE_TABS = ['Linelists', 'Merge Reports', 'Backup', 'Restore'];
 
 // Tab name -> renderer. Renderers return { destroy } for cleanup on switch.
-// Tabs not yet rebuilt fall back to a placeholder.
 const TAB_RENDERERS = {
   Linelists: renderLinelistsTab,
   'Merge Reports': renderMergeTab,
   Backup: renderBackupTab,
   Restore: renderRestoreTab,
+  'Unvoid Patient': renderUnvoidTab,
+  'Reverse Unvoid': renderReverseTab,
+  Decrypt: renderDecryptTab,
 };
 
+function tabsFor(flags) {
+  const tabs = [...BASE_TABS];
+  if (flags && flags.unvoid) tabs.push('Unvoid Patient');
+  if (flags && flags.reverse) tabs.push('Reverse Unvoid');
+  if (flags && flags.decrypt) tabs.push('Decrypt');
+  return tabs;
+}
+
 let currentTab = null;  // { destroy }
+let TABS = [...BASE_TABS];
 
 function renderShell(summary) {
+  TABS = tabsFor(summary.ui_flags);
   const cls = `db-banner--${summary.profile_class || 'unlabeled'}`;
   const detail =
     `DB: ${esc(summary.db_name)} @ ${esc(summary.host)}:${esc(summary.port)} ` +

@@ -507,6 +507,22 @@ body {
 .iconbtn--danger { color: var(--color-danger); }
 .formgrid { display: flex; flex-direction: column; gap: var(--space-3); max-width: 420px; }
 
+/* -- Unvoid / Reverse / Decrypt ------------------------------------------ */
+.preview {
+  margin: 0; padding: var(--space-3); border-radius: var(--radius-md);
+  background: var(--color-surface-2); border: 1px solid var(--color-border);
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto;
+  color: var(--color-text);
+}
+.preview--sm { max-height: 160px; margin: var(--space-2) 0; }
+.dtable tr.tr--selected { background: var(--color-info-bg); }
+.dtable tr[data-op] { cursor: pointer; }
+.dtable--compact th, .dtable--compact td {
+  padding: 2px var(--space-2); font-size: 12px; white-space: nowrap;
+}
+.dtable--compact { font-family: var(--font-mono); }
+
 /* -- banner: fatal config error ------------------------------------------- */
 .fatal {
   max-width: 640px; margin: var(--space-6) auto;

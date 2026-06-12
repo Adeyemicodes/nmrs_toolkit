@@ -65,6 +65,20 @@ export const bridge = {
     run_weekly_batch: (encrypt) => call('linelist_run_weekly_batch', !!encrypt),
     open_folder: () => call('linelist_open_folder'),
   },
+  unvoid: {
+    validate: (identifiers) => call('unvoid_validate', identifiers),
+    commit: () => call('unvoid_commit'),
+  },
+  reverse: {
+    list: () => call('reverse_list'),
+    run: (opId) => call('reverse_run', opId),
+  },
+  decrypt: {
+    list_facilities: () => call('decrypt_list_facilities'),
+    pick_file: () => call('decrypt_pick_file'),
+    preview: (path, keyHex, facility) => call('decrypt_preview', path, keyHex || '', facility || ''),
+    save: (path, keyHex, facility) => call('decrypt_save', path, keyHex || '', facility || ''),
+  },
   restore: {
     pick_file: () => call('restore_pick_file'),
     preview: (dumpPath) => call('restore_preview', dumpPath),
