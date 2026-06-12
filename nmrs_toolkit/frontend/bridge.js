@@ -51,6 +51,13 @@ export const bridge = {
     open_folder: () => call('backup_open_folder'),
     schedule_status: () => call('backup_schedule_status'),
   },
+  merge: {
+    pick_files: () => call('merge_pick_files'),
+    add_files: (paths) => call('merge_add_files', paths || []),
+    pick_output: (suggested) => call('merge_pick_output', suggested || 'merged.csv'),
+    run: (filePaths, sortCol, descending, outputPath, encrypt) =>
+      call('merge_run', filePaths, sortCol || '', !!descending, outputPath, !!encrypt),
+  },
   linelists: {
     list_bundled: () => call('linelist_list_bundled'),
     pick_custom: () => call('linelist_pick_custom'),

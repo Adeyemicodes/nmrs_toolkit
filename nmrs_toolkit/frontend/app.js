@@ -10,6 +10,7 @@ import { initActivityLog } from './tabs/activity-log.js';
 import { renderBackupTab } from './tabs/backup.js';
 import { renderRestoreTab } from './tabs/restore.js';
 import { renderLinelistsTab } from './tabs/linelists.js';
+import { renderMergeTab } from './tabs/merge.js';
 
 const root = document.getElementById('root');
 
@@ -23,6 +24,7 @@ const TABS = ['Linelists', 'Merge Reports', 'Backup', 'Restore', 'Unvoid Patient
 // Tabs not yet rebuilt fall back to a placeholder.
 const TAB_RENDERERS = {
   Linelists: renderLinelistsTab,
+  'Merge Reports': renderMergeTab,
   Backup: renderBackupTab,
   Restore: renderRestoreTab,
 };

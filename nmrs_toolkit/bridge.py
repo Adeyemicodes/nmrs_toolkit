@@ -39,6 +39,7 @@ from .workflows.linelist import (
     append_linelist_log, execute_sql_script, perform_linelist_batch,
     write_linelist_csv,
 )
+from .workflows.merge import append_merge_log, merge_csvs
 from .workflows.restore import append_restore_log, classify_dump, run_restore
 
 
@@ -660,3 +661,79 @@ class Api:
         except OSError:
             pass
         return _os_open(str(LINELIST_DIR))
+
+    # -- merge -----------------------------------------------------------
+
+    @staticmethod
+    def _validate_merge_paths(paths) -> dict:
+        accepted, rejected = [], []
+        for p in paths or []:
+            path = Path(p)
+            if path.exists() and path.is_file():
+                accepted.append({"path": str(path), "name": path.name})
+            else:
+                rejected.append({"path": str(p), "reason": "not found"})
+        return {"ok": True, "accepted": accepted, "rejected": rejected}
+
+    def merge_pick_files(self) -> dict:
+        """Open a multi-select file dialog for CSV / encrypted-CSV inputs."""
+        if self._window is None:
+            return {"ok": False, "message": "No window."}
+        import webview  # lazy
+        result = self._window.create_file_dialog(
+            webview.OPEN_DIALOG, allow_multiple=True,
+            file_types=("CSV / encrypted CSV (*.csv;*.csv.nmrs;*.nmrs)", "All files (*.*)"))
+        if not result:
+            return {"ok": False, "cancelled": True}
+        paths = list(result) if isinstance(result, (list, tuple)) else [result]
+        return self._validate_merge_paths(paths)
+
+    def merge_add_files(self, paths) -> dict:
+        """Validate paths added by drag-and-drop (where the webview exposes them)."""
+        return self._validate_merge_paths(paths)
+
+    def merge_pick_output(self, suggested_name: str = "merged.csv") -> dict:
+        """Open a Save dialog for the merged output (legacy let the user choose)."""
+        if self._window is None:
+            return {"ok": False, "message": "No window."}
+        import webview  # lazy
+        result = self._window.create_file_dialog(
+            webview.SAVE_DIALOG, save_filename=suggested_name or "merged.csv")
+        if not result:
+            return {"ok": False, "cancelled": True}
+        path = result[0] if isinstance(result, (list, tuple)) else result
+        return {"ok": True, "path": str(path)}
+
+    def merge_run(self, file_paths, sort_col: str, descending: bool,
+                  output_path: str, encrypt: bool) -> dict:
+        """Merge the ordered CSV inputs into output_path. Returns an operation_id."""
+        if self.config is None:
+            return {"ok": False, "message": self.config_error or "No configuration."}
+        if not file_paths:
+            return {"ok": False, "message": "Add at least one CSV."}
+        if not (output_path or "").strip():
+            return {"ok": False, "message": "Output path is required."}
+        op_id = self._next_op_id()
+        threading.Thread(
+            target=self._merge_worker,
+            args=(op_id, list(file_paths), Path(output_path),
+                  bool(encrypt), (sort_col or "").strip(), bool(descending)),
+            daemon=True).start()
+        return {"ok": True, "operation_id": op_id}
+
+    def _merge_worker(self, op_id, files, target, encrypt, sort_col, sort_desc):
+        t0 = time.monotonic()
+        append_merge_log(f"Merging {len(files)} file(s) -> {target}  encrypt={encrypt}")
+        try:
+            res = merge_csvs(files, target, encrypt, sort_col, sort_desc,
+                             self.config, log_func=append_merge_log)
+            self._push_op_event({
+                "operation_id": op_id, "op": "merge", "event": "done", "ok": True,
+                "rows": res["n_rows"], "cols": res["n_cols"], "path": str(target),
+                "elapsed": round(time.monotonic() - t0, 1),
+                "message": f"{res['n_rows']} row(s), {res['n_cols']} column(s) -> {target.name}",
+            })
+        except Exception as e:  # noqa: BLE001
+            append_merge_log(f"FAILED: {e}")
+            self._push_op_event({"operation_id": op_id, "op": "merge",
+                                 "event": "error", "ok": False, "message": str(e)})

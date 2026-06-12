@@ -481,6 +481,32 @@ body {
 .modal__actions { display: flex; justify-content: flex-end; gap: var(--space-3);
                   padding: var(--space-4) var(--space-5); border-top: 1px solid var(--color-border); }
 
+/* -- Merge: dropzone, file list, form grid ------------------------------- */
+.dropzone {
+  display: flex; align-items: center; gap: var(--space-3);
+  border: 2px dashed var(--color-border-strong); border-radius: var(--radius-md);
+  padding: var(--space-4); color: var(--color-text-muted); font-size: 13px;
+  background: var(--color-surface-2);
+}
+.dropzone--over { border-color: var(--color-accent); background: var(--color-info-bg); }
+.filelist { list-style: none; margin: var(--space-3) 0 0; padding: 0;
+            border: 1px solid var(--color-border); border-radius: var(--radius-md); overflow: hidden; }
+.filelist__row { display: flex; align-items: center; justify-content: space-between;
+                 padding: var(--space-2) var(--space-3); font-size: 13px; }
+.filelist__row + .filelist__row { border-top: 1px solid var(--color-border); }
+.filelist__name { font-family: var(--font-mono); font-size: 12px; overflow: hidden;
+                  text-overflow: ellipsis; white-space: nowrap; }
+.filelist__ops { display: flex; gap: var(--space-1); flex: 0 0 auto; }
+.filelist__empty { padding: var(--space-3); color: var(--color-text-faint); font-size: 13px; }
+.iconbtn {
+  appearance: none; border: 1px solid var(--color-border-strong); background: var(--color-surface);
+  width: 24px; height: 24px; border-radius: var(--radius-sm); cursor: pointer;
+  font-size: 12px; line-height: 1; color: var(--color-text);
+}
+.iconbtn:disabled { opacity: 0.4; cursor: not-allowed; }
+.iconbtn--danger { color: var(--color-danger); }
+.formgrid { display: flex; flex-direction: column; gap: var(--space-3); max-width: 420px; }
+
 /* -- banner: fatal config error ------------------------------------------- */
 .fatal {
   max-width: 640px; margin: var(--space-6) auto;
