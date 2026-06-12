@@ -9,3 +9,9 @@ cryptography
 # imports — both broke the frozen build. Pin so the build machine's version
 # matches what the code/spec were tested against. Bump deliberately, not by drift.
 mysql-connector-python==9.7.0
+# v2 PyWebView shell. Pure-Python; on Linux it renders through the system GTK +
+# WebKit2 backend (apt: gir1.2-webkit2-4.0 python3-gi), on Windows EdgeChromium.
+# Headless --backup / --generate-linelists never import it.
+# Pinned to 3.7.2 for WebKit2GTK 4.0 compatibility (Ubuntu 20.04/22.04). On
+# WebKit2GTK 4.1 systems, pywebview>=5 also works — see pyproject.toml note.
+pywebview==3.7.2

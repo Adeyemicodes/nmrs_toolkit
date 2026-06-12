@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <!-- Offline-first, no outbound requests. The security goal is "no network
+       egress": connect-src 'none' blocks every fetch/XHR/websocket, and
+       default-src 'none' blocks any other remote load — so nothing can leave
+       the machine. script-src allows 'unsafe-eval'/'unsafe-inline' ONLY because
+       PyWebView's native Python<->JS bridge injects and evaluates JS to deliver
+       call results; all scripts are local ('self') and all DB/user text is HTML-
+       escaped before insertion, so there is no remote-content XSS vector. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'self' 'unsafe-inline';
+                 script-src 'self' 'unsafe-eval' 'unsafe-inline';
+                 img-src 'self' data:; connect-src 'none'; font-src 'self';" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NMRS Toolkit</title>
+  <link rel="stylesheet" href="tokens.css" />
+  <link rel="stylesheet" href="components.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
