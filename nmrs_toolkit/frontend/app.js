@@ -14,6 +14,7 @@ import { renderMergeTab } from './tabs/merge.js';
 import { renderUnvoidTab } from './tabs/unvoid.js';
 import { renderReverseTab } from './tabs/reverse-unvoid.js';
 import { renderDecryptTab } from './tabs/decrypt.js';
+import { renderDashboardTab } from './tabs/dashboard.js';
 
 const root = document.getElementById('root');
 
@@ -21,11 +22,12 @@ const esc = (s) =>
   String(s).replace(/[&<>"]/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-// The four always-on tabs; the rest are config-gated (see ui_flags).
-const BASE_TABS = ['Linelists', 'Merge Reports', 'Backup', 'Restore'];
+// Always-on tabs (Dashboard first); the rest are config-gated (see ui_flags).
+const BASE_TABS = ['Dashboard', 'Linelists', 'Merge Reports', 'Backup', 'Restore'];
 
 // Tab name -> renderer. Renderers return { destroy } for cleanup on switch.
 const TAB_RENDERERS = {
+  Dashboard: renderDashboardTab,
   Linelists: renderLinelistsTab,
   'Merge Reports': renderMergeTab,
   Backup: renderBackupTab,
