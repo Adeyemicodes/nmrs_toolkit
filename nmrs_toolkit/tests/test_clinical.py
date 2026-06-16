@@ -113,19 +113,28 @@ class TestMmd(unittest.TestCase):
 
 
 class TestBiometric(unittest.TestCase):
-    def test_up_to_date_and_recapture(self):
-        recent = END - timedelta(days=100)
-        old = END - timedelta(days=400)
-        self.assertTrue(C.biometric_status("Yes", "Yes", recent, END)["up_to_date"])
-        s_old = C.biometric_status("Yes", "Yes", old, END)
-        self.assertFalse(s_old["up_to_date"])
-        self.assertTrue(s_old["needs_recapture"])
-        s_invalid = C.biometric_status("Yes", "", recent, END)
-        self.assertFalse(s_invalid["up_to_date"])
-        self.assertTrue(s_invalid["needs_recapture"])
-        s_never = C.biometric_status("No", "", None, END)
-        self.assertFalse(s_never["captured"])
-        self.assertFalse(s_never["needs_recapture"])
+    def test_baseline_recapture_cascade(self):
+        # baseline only (no recapture)
+        b = C.biometric_status("Yes")
+        self.assertTrue(b["baseline"])
+        self.assertFalse(b["recaptured"])
+        self.assertFalse(b["suspicious"])
+        # recapture cascades from baseline (has a RecaptureDate)
+        rc = C.biometric_status("Yes", recapture_date=date(2025, 6, 1))
+        self.assertTrue(rc["baseline"])
+        self.assertTrue(rc["recaptured"])
+        self.assertFalse(rc["suspicious"])
+        # recapture via RecaptureCount > 0
+        self.assertTrue(C.biometric_status("Yes", recapture_count=2)["recaptured"])
+        # suspicious: recapture without a baseline
+        s = C.biometric_status("No", recapture_date=date(2025, 6, 1))
+        self.assertFalse(s["baseline"])
+        self.assertFalse(s["recaptured"])
+        self.assertTrue(s["suspicious"])
+        # no capture at all
+        n = C.biometric_status("No")
+        self.assertTrue(n["no_capture"])
+        self.assertFalse(n["recaptured"])
 
 
 class TestRealCsvEquivalence(unittest.TestCase):
@@ -134,12 +143,13 @@ class TestRealCsvEquivalence(unittest.TestCase):
     repo test suite never depends on patient data)."""
 
     def test_matches_real_currentartstatus(self):
-        from pathlib import Path
-        matches = sorted(glob.glob(str(Path.home() / "NMRS_Linelists" / "Treatment_*.csv")))
-        if not matches:
-            self.skipTest("no real Treatment linelist present")
         from nmrs_toolkit.dashboard import loader
-        path = matches[-1]
+        # Use latest_linelist(): it excludes Treatment_asof_* snapshots (which are
+        # generated at a chosen @endDate, so their CurrentARTStatus wouldn't match
+        # a generation-date recompute).
+        path = loader.latest_linelist()
+        if path is None:
+            self.skipTest("no real (non-snapshot) Treatment linelist present")
         frame = loader.load_linelist(path)
         # End date = the CSV generation date (its @endDate = NOW at generation).
         gen = frame.generated_at.date() if frame.generated_at else date.today()

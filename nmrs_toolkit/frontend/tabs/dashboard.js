@@ -56,6 +56,7 @@ export function renderDashboardTab(root) {
         <div class="progress"><div class="progress__bar progress__bar--indeterminate"></div></div>
         <span id="dash-progress-text">Regenerating linelist from the database…</span>
       </div>
+      <div class="dash__hint is-hidden" id="dash-hint"></div>
       <div class="dash__grid" id="dash-grid"></div>
     </section>`;
 
@@ -100,8 +101,19 @@ export function renderDashboardTab(root) {
   }
 
   // -- date range (instant, in-memory recompute) ---------------------------
-  el('#dash-start').addEventListener('change', (e) => { state.start = e.target.value; recompute(); });
-  el('#dash-end').addEventListener('change', (e) => { state.end = e.target.value; recompute(); });
+  // Enforce start <= end via native min/max (greys out invalid days in the
+  // picker) rather than blur() — blur closed the whole calendar on month/year
+  // navigation too. recompute() also guards as a backstop for typed input.
+  el('#dash-start').addEventListener('change', (e) => {
+    state.start = e.target.value;
+    el('#dash-end').min = state.start;
+    recompute();
+  });
+  el('#dash-end').addEventListener('change', (e) => {
+    state.end = e.target.value;
+    el('#dash-start').max = state.end;
+    recompute();
+  });
 
   // -- toolbar actions -----------------------------------------------------
   el('#dash-refresh').addEventListener('click', refreshFromDb);
@@ -139,16 +151,35 @@ export function renderDashboardTab(root) {
   async function exportIndicator(slug) {
     const res = await bridge.dashboard.export(slug, state.start, state.end,
       state.facilityFilter.length ? state.facilityFilter : null);
-    if (res && res.ok && window.__toast) window.__toast(`Exported → ${res.path}`);
-    else if (window.__toast) window.__toast(`Export failed: ${(res && res.message) || 'error'}`);
+    if (res && res.ok && window.__toast) {
+      window.__toast(`Exported report + ${res.linelist_rows}-client line list → NMRS_Dashboard_Exports`);
+    } else if (window.__toast) {
+      window.__toast(`Export failed: ${(res && res.message) || 'error'}`);
+    }
   }
 
   // -- compute + render ----------------------------------------------------
   async function recompute() {
+    if (state.start > state.end) {  // backstop for typed/out-of-order input
+      const hint = el('#dash-hint');
+      hint.textContent = `Start date (${state.start}) is after end date (${state.end}).`;
+      hint.classList.remove('is-hidden');
+      return;
+    }
     const res = await bridge.dashboard.compute(state.start, state.end,
       state.facilityFilter.length ? state.facilityFilter : null);
     if (!res.ok) { grid.innerHTML = `<div class="dash__empty">${esc(res.message || 'No data.')}</div>`; return; }
     state.summary = res;
+    // Snapshot indicators beyond the data date are projections (patients pushed
+    // past their LTFU cutoff) — point the user to Refresh from DB for an exact one.
+    const hint = el('#dash-hint');
+    if (state.dataDate && state.end > state.dataDate) {
+      hint.textContent = `Snapshots after the data date (${state.dataDate}) are projected forward `
+        + `(TX_CURR drops as patients pass their next-pickup window). Use “Refresh from DB” for an exact snapshot at ${state.end}.`;
+      hint.classList.remove('is-hidden');
+    } else {
+      hint.classList.add('is-hidden');
+    }
     renderCards();
   }
 
@@ -253,13 +284,13 @@ export function renderDashboardTab(root) {
         scales: { x: { stacked: true, ticks: { callback: (v) => Math.abs(v) } }, y: { stacked: true } } },
     });
 
-    // Biometric — 3-segment horizontal bar.
+    // Biometric — Baseline / Recaptured / No capture (recapture ⊆ baseline).
     const b = s.biometric_coverage;
     mk(cv('bio'), {
       type: 'bar',
-      data: { labels: ['Captured', 'Valid', 'Up to date'],
-        datasets: [{ data: [b.captured, b.valid, b.up_to_date],
-          backgroundColor: [c.info, c.teal, c.success] }] },
+      data: { labels: ['Baseline', 'Recaptured', 'No capture'],
+        datasets: [{ data: [b.baseline, b.recaptured, b.no_capture],
+          backgroundColor: [c.success, c.teal, c.amber] }] },
       options: { indexAxis: 'y',
         plugins: { legend: { display: false }, tooltip: pctTooltip(() => b.total) },
         scales: { x: { beginAtZero: true } } },
@@ -273,12 +304,34 @@ export function renderDashboardTab(root) {
         `<button class="chip ${i === 0 ? 'chip--on' : ''}" data-split="${k}">${label}</button>`).join('') +
       `</div>`;
   }
+  // Fixed clinical orderings so disaggregations are stable (never count-sorted).
+  const SEX_ORDER = ['F', 'M', 'Unknown'];
+  const BAND_ORDER = ['Pediatric (0-9)', 'Adolescent (10-19)', 'Adult (20+)', 'Unknown'];
   function breakdownHtml(indicator, splitKey) {
     const field = (SPLITS.find((s) => s[0] === splitKey) || [])[2];
     if (!field || !indicator[field]) {
       return `<div class="dash-total">${num(indicator.total)}</div>`;
     }
-    const entries = Object.entries(indicator[field]).sort((a, b) => b[1] - a[1]);
+    const data = indicator[field];
+    if (splitKey === 'sex') {
+      return rows(SEX_ORDER.filter((k) => k in data).map((k) => [k, data[k]]));
+    }
+    if (splitKey === 'age') {
+      return rows(BAND_ORDER.filter((k) => k in data).map((k) => [k, data[k]]));
+    }
+    if (splitKey === 'sexage') {
+      // Aligned grid: one row per age band, F / M columns side by side.
+      const sexes = SEX_ORDER.filter((s) => BAND_ORDER.some((b) => `${s} | ${b}` in data));
+      const header = `<tr><th>Age band</th>${sexes.map((s) => `<th>${s}</th>`).join('')}</tr>`;
+      const body = BAND_ORDER
+        .filter((b) => sexes.some((s) => `${s} | ${b}` in data))
+        .map((b) => `<tr><td>${esc(b)}</td>${sexes.map((s) =>
+          `<td>${num(data[`${s} | ${b}`] || 0)}</td>`).join('')}</tr>`).join('');
+      return `<table class="dash-break">${header}${body}</table>`;
+    }
+    return rows(Object.entries(data).sort((a, b) => b[1] - a[1]));
+  }
+  function rows(entries) {
     return `<table class="dash-break">${entries.map(([g, c]) =>
       `<tr><td>${esc(g)}</td><td>${num(c)}</td></tr>`).join('')}</table>`;
   }
@@ -342,12 +395,20 @@ export function renderDashboardTab(root) {
     </div>`;
   }
   function biometricCard(b, stamp) {
+    const flag = b.suspicious
+      ? `<div class="dash-card__sub dash-amber-inline">⚠ ${num(b.suspicious)} recapture(s) without a baseline (data anomaly)</div>`
+      : '';
     return `<div class="dash-card" data-indicator="biometric_coverage">
       <div class="dash-card__title">Biometric Capture</div>
-      <div class="dash-card__sub">${esc(stamp)} (TX_CURR) · needs recapture
-        <strong class="dash-amber-inline">${num(b.needs_recapture)}</strong></div>
+      <div class="dash-card__sub">${esc(stamp)} (TX_CURR) · recapture cascades from baseline</div>
+      <div class="dash-bio">
+        <div><div class="dash-total">${num(b.baseline)}</div><div class="dash-card__sub">Baseline</div></div>
+        <div><div class="dash-total">${num(b.recaptured)}</div><div class="dash-card__sub">Recaptured</div></div>
+        <div><div class="dash-total dash-total--amber">${num(b.no_capture)}</div><div class="dash-card__sub">No capture</div></div>
+      </div>
+      ${flag}
       <div class="dash-chart dash-chart--short"><canvas data-chart="bio"></canvas></div>
-      <button class="btn btn--secondary btn--sm" data-export="biometric_coverage">Export</button>
+      <button class="btn btn--secondary btn--sm" data-export="biometric_coverage">Export (no-capture list)</button>
     </div>`;
   }
 
@@ -382,6 +443,24 @@ export function renderDashboardTab(root) {
     el('#dash-facility').textContent = load.facility;
     el('#dash-source').textContent =
       `Source: ${load.source} · ${num(load.rows)} rows${load.generated_at ? ' · generated ' + load.generated_at : ''}`;
+    // Default the snapshot end-date to the DATA date (the @endDate the linelist
+    // was built at), not the current quarter-end. A future end_date would push
+    // patients past their LTFU cutoff and make TX_CURR look reduced; anchoring on
+    // the data date gives the true "current" count. Start = that date's quarter.
+    if (load.generated_at) {
+      const dd = new Date(load.generated_at);
+      if (!isNaN(dd)) {
+        state.dataDate = iso(dd);
+        const q = Math.floor(dd.getMonth() / 3);
+        state.start = iso(new Date(dd.getFullYear(), q * 3, 1));
+        state.end = state.dataDate;
+        el('#dash-start').value = state.start;
+        el('#dash-end').value = state.end;
+      }
+    }
+    // Enforce ordering from the start (start <= end) in the native pickers.
+    el('#dash-start').max = state.end;
+    el('#dash-end').min = state.start;
     await recompute();
   })();
 

@@ -28,6 +28,7 @@ _DATE_COLS = {
     "DateReturnedToCare": "date_returned",
     "PatientOutcomeDate": "outcome_date",
     "BiometricCaptureDate": "biometric_date",
+    "RecaptureDate": "recapture_date",
 }
 _STR_COLS = {
     "FacilityName": "facility",
@@ -44,6 +45,7 @@ _INT_COLS = {
     "MonthsOnART": "months_on_art",
     "CurrentAgeYears": "age_years",
     "CurrentAgeMonths": "age_months",
+    "RecaptureCount": "recapture_count",
 }
 
 

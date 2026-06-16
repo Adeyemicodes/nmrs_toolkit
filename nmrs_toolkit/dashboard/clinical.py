@@ -260,16 +260,21 @@ def is_mmd_covered(bucket: str) -> bool:
 
 
 def biometric_status(biometric_captured: Optional[str],
-                     valid_capture: Optional[str],
-                     capture_date: Optional[date],
-                     end_date: date) -> dict:
-    """Return {captured, valid, up_to_date, needs_recapture}.
-    up_to_date   = captured AND valid AND captured within 12 months of end_date.
-    needs_recapture = captured but (>12 months old OR not valid)."""
-    captured = (biometric_captured or "").strip().lower() == "yes"
-    valid = (valid_capture or "").strip().lower() == "yes"
-    recent = is_vl_within_12mo(capture_date, end_date) if capture_date else False
-    up_to_date = captured and valid and recent
-    needs_recapture = captured and not up_to_date
-    return {"captured": captured, "valid": valid,
-            "up_to_date": up_to_date, "needs_recapture": needs_recapture}
+                     recapture_date: Optional[date] = None,
+                     recapture_count: Optional[int] = None) -> dict:
+    """Biometric capture state. Recapture cascades from baseline.
+
+    baseline   = a baseline biometric has been captured (BiometricCaptured=Yes).
+    recaptured = a recapture has occurred (a RecaptureDate or RecaptureCount>0),
+                 AND a baseline exists (the normal cascade).
+    suspicious = a recapture is recorded with NO baseline — a data anomaly.
+    no_capture = no baseline at all (the capture gap to action).
+    (A fingerprint 'match'-at-pickup metric is a planned future addition.)"""
+    baseline = (biometric_captured or "").strip().lower() == "yes"
+    has_recap = bool(recapture_date) or (_to_int(recapture_count) or 0) > 0
+    return {
+        "baseline": baseline,
+        "recaptured": baseline and has_recap,
+        "suspicious": has_recap and not baseline,
+        "no_capture": not baseline,
+    }

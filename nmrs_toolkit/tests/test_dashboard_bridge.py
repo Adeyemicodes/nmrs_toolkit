@@ -63,17 +63,24 @@ class TestDashboardBridge(unittest.TestCase):
         api._dashboard_records = [_rec()]
         self.assertFalse(api.dashboard_compute("nope", "2026-01-01")["ok"])
 
-    def test_export_writes_banner_to_temp(self):
+    def test_export_writes_report_and_linelist(self):
         api = _api()
-        api._dashboard_records = [_rec(), _rec()]
+        # _raw must be present for the line-list sheet.
+        api._dashboard_records = [_rec(_raw={"FacilityName": "Test HC", "Sex": "F"}),
+                                  _rec(sex="M", _raw={"FacilityName": "Test HC", "Sex": "M"})]
         api._dashboard_sources = ["Treatment_x.csv"]
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(dash_exports, "DASHBOARD_EXPORTS_DIR", Path(d)):
                 res = api.dashboard_export("tx_curr", "2025-01-01", "2026-01-01")
-            self.assertTrue(res["ok"])
-            text = Path(res["path"]).read_text()
-        self.assertTrue(text.startswith("# DASHBOARD EXPORT"))
-        self.assertIn("THIS IS NOT A CURRENT LINELIST", text)
+                self.assertTrue(res["ok"])
+                report = Path(res["report_path"]).read_text()
+                linelist = Path(res["linelist_path"]).read_text()
+        self.assertTrue(report.startswith("# DASHBOARD EXPORT"))
+        self.assertIn("THIS IS NOT A CURRENT LINELIST", report)
+        self.assertIn("Sex | Age band", report)         # cross-tab header
+        self.assertIn("THIS IS NOT A CURRENT LINELIST", linelist)
+        self.assertIn("FacilityName", linelist)         # line-list carries raw columns
+        self.assertEqual(res["linelist_rows"], 2)
 
     def test_export_unknown_indicator(self):
         api = _api()

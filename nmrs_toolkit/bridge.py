@@ -1250,17 +1250,20 @@ class Api:
         entry = _DASHBOARD_INDICATORS.get(indicator_slug)
         if entry is None:
             return {"ok": False, "message": f"Unknown indicator: {indicator_slug}"}
-        name, fn = entry
+        name = entry[0]
         try:
             sd, ed = self._parse_iso(start_date), self._parse_iso(end_date)
         except ValueError:
             return {"ok": False, "message": "Dates must be YYYY-MM-DD."}
         records = self._filtered_records(facility_filter)
-        indicator = fn(records, sd, ed)
+        report_tables = dash_indicators.report_for(indicator_slug, records, sd, ed)
+        affected = dash_indicators.affected_records(indicator_slug, records, sd, ed)
         res = dash_exports.write_export(indicator_slug, name, start_date, end_date,
-                                        self._dashboard_sources, indicator)
+                                        self._dashboard_sources, report_tables, affected)
         self._log.emit(f"exported {indicator_slug} {start_date}..{end_date} "
-                       f"-> {Path(res['path']).name}", category="DASHBOARD")
+                       f"-> {Path(res['report_path']).name} + "
+                       f"{Path(res['linelist_path']).name} ({res['linelist_rows']} clients)",
+                       category="DASHBOARD")
         return res
 
     def dashboard_open_exports_folder(self) -> dict:
