@@ -73,8 +73,12 @@ a = Analysis(
         'mysql.connector.plugins.caching_sha2_password',
         'mysql.connector.plugins.sha256_password',
         'mysql.connector.plugins.mysql_clear_password',
+        # Analytics Dashboard package (bridge imports it; collect explicitly so
+        # every submodule is bundled regardless of import-analysis depth).
+        'nmrs_toolkit.dashboard',
     ] + _crypto_hiddenimports + _wv_hiddenimports
-       + collect_submodules('nmrs_toolkit.workflows'),
+       + collect_submodules('nmrs_toolkit.workflows')
+       + collect_submodules('nmrs_toolkit.dashboard'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

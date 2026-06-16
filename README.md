@@ -65,6 +65,32 @@ All workflows emit through a single **AppLogger**. On-disk forensic logs:
 before any line is written. The in-app **Activity Log** drawer tails, filters,
 searches, and exports these logs.
 
+## Analytics Dashboard
+
+The **Dashboard** tab turns the Treatment line list into PEPFAR-style program
+indicators — Ever Enrolled, TX_NEW, TX_CURR, Currently IIT (with duration
+breakdown), TX_ML, TX_RTT, the VL cascade, MMD share, an age/sex pyramid, and
+biometric coverage — each disaggregable by sex / age / sex×age and rendered with
+Chart.js (vendored locally; no CDN). It reads the most recent
+`Treatment_*.csv` in `NMRS_Linelists/`; changing the date range recomputes
+instantly in memory (no DB). Snapshot indicators are stamped **"as of &lt;end&gt;"**
+and period-flow indicators **"Period: &lt;start&gt; to &lt;end&gt;"** so the two
+are never confused. Clinical status is recomputed from raw columns and mirrors
+`scripts/TreatmentLinelistv3_2.sql` exactly (validated against the real
+`CurrentARTStatus` column).
+
+**"Refresh from DB"** regenerates the line list at the chosen end date (passed as
+`@endDate`) for an exact historical snapshot.
+
+> ⚠️ **Dashboard exports are NOT current line lists.** Per-indicator and
+> "Export current view" buttons write to `~/NMRS_Dashboard_Exports/`
+> (`C:\NMRS_Dashboard_Exports` on Windows) — a folder **deliberately separate**
+> from `NMRS_Linelists/`. Every export's first rows carry a
+> `THIS IS NOT A CURRENT LINELIST` banner. These are point-in-time indicator
+> extracts; **do not use them for current program/patient decisions** — pull a
+> fresh line list for that. The dashboard is indicator-only (no patient-level
+> views), and logs only counts/rates (never patient identifiers).
+
 ## Configuration
 
 The application reads runtime settings from `.nmrs_config.ini`. A template (`.nmrs_config.example.ini`) is committed to the repo and also bundled inside each release binary; copy it to `.nmrs_config.ini`, fill in the values, and save it **next to the binary**. On the first launch the app will:

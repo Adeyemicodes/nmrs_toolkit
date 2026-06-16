@@ -30,7 +30,10 @@ qt = ["pyqt5", "pyqtwebengine"]
 nmrs-toolkit = "nmrs_toolkit.__main__:main"
 
 [tool.setuptools]
-packages = ["nmrs_toolkit", "nmrs_toolkit.workflows"]
+packages = ["nmrs_toolkit", "nmrs_toolkit.workflows", "nmrs_toolkit.dashboard"]
 
 [tool.setuptools.package-data]
-nmrs_toolkit = ["frontend/*.html", "frontend/*.css", "frontend/*.js", "frontend/tabs/*.js"]
+nmrs_toolkit = [
+    "frontend/*.html", "frontend/*.css", "frontend/*.js",
+    "frontend/tabs/*.js", "frontend/tabs/*.css", "frontend/vendor/*.js",
+]
