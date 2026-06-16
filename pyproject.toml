@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nmrs-toolkit"
+version = "2.0.0a0"
+description = "Linelist runner, encrypted CSV merge, and scheduled DB backup for NMRS facilities."
+requires-python = ">=3.8"
+dependencies = [
+    "cryptography",
+    # Pinned: 9.x removed cursor.execute(multi=) and moved auth plugins to
+    # dynamic imports — both broke the frozen build. Bump deliberately.
+    "mysql-connector-python==9.7.0",
+    # PyWebView shell (v2). Backend/version matrix matters on Linux:
+    #   * WebKit2GTK 4.1 (Ubuntu 24.04+, libwebkit2gtk-4.1): pywebview>=5 works.
+    #   * WebKit2GTK 4.0 (Ubuntu 20.04/22.04, libwebkit2gtk-4.0): pywebview 3.7.x
+    #     (uses run_javascript; 4.x's 4.0 fallback is broken, 5.x/6.x need 4.1).
+    # We pin to the broadest-compatible line for the current facility laptops
+    # (WebKit2 4.0). Revisit in Phase 8 packaging once the target OS is fixed.
+    "pywebview==3.7.2",
+]
+
+[project.optional-dependencies]
+# Linux GTK backend helpers (the WebKit2/GTK gobject bindings are system
+# packages, not pip — see README). Qt is an alternative backend.
+qt = ["pyqt5", "pyqtwebengine"]
+
+[project.scripts]
+nmrs-toolkit = "nmrs_toolkit.__main__:main"
+
+[tool.setuptools]
+packages = ["nmrs_toolkit", "nmrs_toolkit.workflows", "nmrs_toolkit.dashboard"]
+
+[tool.setuptools.package-data]
+nmrs_toolkit = [
+    "frontend/*.html", "frontend/*.css", "frontend/*.js",
+    "frontend/tabs/*.js", "frontend/tabs/*.css", "frontend/vendor/*.js",
+]

@@ -28,7 +28,10 @@
 SET SESSION optimizer_switch = 'block_nested_loop=off';
 SET GLOBAL innodb_buffer_pool_size = 8589934592;
 
-SET @endDate = NOW();
+-- Default to NOW(), but honor a caller-preset @endDate (the Analytics Dashboard
+-- regenerates this linelist at a chosen snapshot date by pre-setting @endDate
+-- before this script runs). Normal linelist runs leave @endDate unset -> NOW().
+SET @endDate = IFNULL(@endDate, NOW());
 
 -- Previous-quarter end date (replaces getendofquarter function)
 SET @_pq = DATE_SUB(@endDate, INTERVAL 3 MONTH);
