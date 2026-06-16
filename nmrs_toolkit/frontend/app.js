@@ -23,7 +23,7 @@ const esc = (s) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 // Always-on tabs (Dashboard first); the rest are config-gated (see ui_flags).
-const BASE_TABS = ['Dashboard', 'Linelists', 'Merge Reports', 'Backup', 'Restore'];
+const BASE_TABS = ['Dashboard', 'Linelists', 'Backup', 'Restore'];
 
 // Tab name -> renderer. Renderers return { destroy } for cleanup on switch.
 const TAB_RENDERERS = {
@@ -39,6 +39,7 @@ const TAB_RENDERERS = {
 
 function tabsFor(flags) {
   const tabs = [...BASE_TABS];
+  if (flags && flags.merge) tabs.push('Merge Reports');
   if (flags && flags.unvoid) tabs.push('Unvoid Patient');
   if (flags && flags.reverse) tabs.push('Reverse Unvoid');
   if (flags && flags.decrypt) tabs.push('Decrypt');
@@ -51,9 +52,10 @@ let TABS = [...BASE_TABS];
 function renderShell(summary) {
   TABS = tabsFor(summary.ui_flags);
   const cls = `db-banner--${summary.profile_class || 'unlabeled'}`;
+  // DB name + host/port identify the profile; the connecting user is omitted
+  // from the banner (less info disclosure — it isn't needed operationally).
   const detail =
-    `DB: ${esc(summary.db_name)} @ ${esc(summary.host)}:${esc(summary.port)} ` +
-    `· user: ${esc(summary.user)}`;
+    `DB: ${esc(summary.db_name)} @ ${esc(summary.host)}:${esc(summary.port)}`;
 
   root.innerHTML = `
     <div class="shell">

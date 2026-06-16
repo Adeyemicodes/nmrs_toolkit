@@ -267,6 +267,7 @@ class Api:
             return {"unvoid": False, "reverse": False, "decrypt": False}
         g = self.config.getboolean
         return {
+            "merge": g("ui", "merge_tab_enabled", fallback=False),
             "unvoid": g("ui", "unvoid_tab_enabled", fallback=True),
             "reverse": g("ui", "reverse_tab_enabled", fallback=False),
             "decrypt": g("ui", "decrypt_tab_enabled", fallback=False),

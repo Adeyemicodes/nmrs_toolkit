@@ -32,7 +32,7 @@ export async function renderLogin(root, onAuthenticated) {
   const passwordField = noGate
     ? ''
     : `<label class="field">
-         <span class="field__label">Administrator password</span>
+         <span class="field__label">Password</span>
          <input id="login-pw" class="field__input" type="password"
                 autocomplete="off" autofocus />
        </label>`;
