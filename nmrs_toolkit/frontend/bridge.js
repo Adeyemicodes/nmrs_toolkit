@@ -86,6 +86,16 @@ export const bridge = {
       call('restore_run', dumpPath, targetDb, keyHex, typedConfirmation),
     cancel: (operationId) => call('restore_cancel', operationId),
   },
+  dashboard: {
+    status: () => call('dashboard_status'),
+    load_latest: () => call('dashboard_load_latest'),
+    pick_folder: () => call('dashboard_pick_folder'),
+    load_folder: (folder) => call('dashboard_load_folder', folder),
+    compute: (start, end, facilityFilter) => call('dashboard_compute', start, end, facilityFilter || null),
+    refresh_from_db: (end) => call('dashboard_refresh_from_db', end),
+    export: (slug, start, end, facilityFilter) => call('dashboard_export', slug, start, end, facilityFilter || null),
+    open_exports_folder: () => call('dashboard_open_exports_folder'),
+  },
   log: {
     subscribe: (categories) => call('log_subscribe', categories || null),
     unsubscribe: () => call('log_unsubscribe'),

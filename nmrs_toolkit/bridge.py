@@ -53,9 +53,28 @@ from .workflows.unvoid import (
     get_window_seconds, lookup_patient, reverse_one, tokenize_identifiers,
     unvoid_one,
 )
+from .constants import DASHBOARD_EXPORTS_DIR
+from .dashboard import exports as dash_exports
+from .dashboard import indicators as dash_indicators
+from .dashboard import loader as dash_loader
 
 DECRYPT_PREVIEW_ROWS = 200
 _FACILITY_PLACEHOLDER = "— select facility —"
+
+# Dashboard export slug -> (display name, indicator function).
+_DASHBOARD_INDICATORS = {
+    "ever_enrolled": ("Ever Enrolled", dash_indicators.ever_enrolled),
+    "tx_new": ("TX_NEW", dash_indicators.tx_new),
+    "tx_curr": ("TX_CURR", dash_indicators.tx_curr),
+    "currently_iit": ("Currently IIT", dash_indicators.currently_iit),
+    "tx_ml": ("TX_ML", dash_indicators.tx_ml),
+    "tx_rtt": ("TX_RTT", dash_indicators.tx_rtt),
+    "vl_cascade": ("VL Cascade", dash_indicators.vl_cascade),
+    "mmd_distribution": ("MMD Distribution", dash_indicators.mmd_distribution),
+    "age_sex_pyramid": ("Age/Sex Pyramid", dash_indicators.age_sex_pyramid),
+    "biometric_coverage": ("Biometric Coverage", dash_indicators.biometric_coverage),
+    "cohort_flow": ("Cohort Flow", dash_indicators.cohort_flow),
+}
 
 
 def _os_open(path: str) -> dict:
@@ -116,6 +135,8 @@ class Api:
         self._restore_cancels: dict = {}  # operation_id -> threading.Event
         self._unvoid_batch: list = []     # validated patient dicts (server-side)
         self._unvoid_skipped: list = []
+        self._dashboard_records: list = []   # parsed loader records (cached)
+        self._dashboard_sources: list = []   # source CSV name(s)
         self.config = None
         self.config_error: Optional[str] = None
         # Restart survival: seed the ring buffer from APPLICATION_LOG_FILE so the
@@ -486,6 +507,20 @@ class Api:
         if multiple:
             return {"ok": True, "paths": [str(p) for p in paths]}
         return {"ok": True, "path": str(paths[0])}
+
+    def _open_folder(self) -> dict:
+        """Shared FOLDER picker. Returns {ok, path} / {cancelled} / {ok:False}."""
+        if self._window is None:
+            return {"ok": False, "message": "No window."}
+        try:
+            import webview  # lazy
+            result = self._window.create_file_dialog(webview.FOLDER_DIALOG)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"Folder dialog failed: {e}"}
+        if not result:
+            return {"ok": False, "cancelled": True}
+        path = result[0] if isinstance(result, (list, tuple)) else result
+        return {"ok": True, "path": str(path)}
 
     # -- restore (highest-risk workflow) ---------------------------------
 
@@ -1053,3 +1088,184 @@ class Api:
         Path(target).write_bytes(out_bytes)
         self._log.emit(f"wrote plaintext -> {target}", category="UI")
         return {"ok": True, "path": str(target), "bytes": len(out_bytes)}
+
+    # -- analytics dashboard --------------------------------------------
+
+    def _dashboard_admin_mode(self) -> bool:
+        return (self.config is not None
+                and self.config.getboolean("ui", "dashboard_admin_mode", fallback=False))
+
+    def _parse_iso(self, s):
+        from datetime import date, datetime
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+
+    def dashboard_status(self) -> dict:
+        """Initial state for the dashboard tab."""
+        latest = dash_loader.latest_linelist()
+        gen = None
+        if latest is not None:
+            from datetime import datetime
+            try:
+                gen = datetime.fromtimestamp(latest.stat().st_mtime).isoformat(timespec="seconds")
+            except OSError:
+                gen = None
+        return {
+            "ok": True,
+            "latest_linelist": latest.name if latest else None,
+            "generated_at": gen,
+            "admin_mode": self._dashboard_admin_mode(),
+            "export_dir": str(DASHBOARD_EXPORTS_DIR),
+        }
+
+    def dashboard_load_latest(self) -> dict:
+        """Load the most recent Treatment linelist into the cache."""
+        if self.config is None:
+            return {"ok": False, "message": self.config_error or "No configuration."}
+        latest = dash_loader.latest_linelist()
+        if latest is None:
+            self._log.emit("no Treatment linelist found to load", category="DASHBOARD", level="warn")
+            return {"ok": False, "message": "No Treatment linelist found in NMRS_Linelists."}
+        try:
+            key = self._dashboard_key()
+            frame = dash_loader.load_linelist(latest, decrypt_key=key)
+        except Exception as e:  # noqa: BLE001
+            self._log.emit(f"load failed: {e}", category="DASHBOARD", level="error")
+            return {"ok": False, "message": str(e)}
+        self._dashboard_records = frame.records
+        self._dashboard_sources = [frame.source_name]
+        self._log.emit(f"loaded {frame.row_count} row(s) from {frame.source_name}",
+                       category="DASHBOARD")
+        gen = frame.generated_at.isoformat(timespec="seconds") if frame.generated_at else None
+        return {"ok": True, "source": frame.source_name, "rows": frame.row_count,
+                "facility": frame.facility_name, "generated_at": gen}
+
+    def dashboard_pick_folder(self) -> dict:
+        return self._open_folder()
+
+    def dashboard_load_folder(self, folder: str) -> dict:
+        """Admin mode: load every Treatment_*.csv* in `folder`."""
+        if not self._dashboard_admin_mode():
+            return {"ok": False, "message": "Multi-facility mode is disabled (dashboard_admin_mode)."}
+        try:
+            frames = dash_loader.load_linelist_folder(folder, decrypt_key=self._dashboard_key())
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": str(e)}
+        if not frames:
+            return {"ok": False, "message": "No Treatment_*.csv files in that folder."}
+        self._dashboard_records = dash_loader.concat(frames)
+        self._dashboard_sources = [f.source_name for f in frames]
+        facilities = sorted({f.facility_name for f in frames})
+        self._log.emit(f"loaded {len(frames)} file(s), {len(self._dashboard_records)} rows "
+                       f"across {len(facilities)} facility(ies)", category="DASHBOARD")
+        return {"ok": True, "sources": self._dashboard_sources, "facilities": facilities,
+                "total_rows": len(self._dashboard_records)}
+
+    def _dashboard_key(self):
+        """Facility key for decrypting .csv.nmrs linelists, or None if unset."""
+        try:
+            from .crypto import get_facility_key
+            return get_facility_key(self.config)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _filtered_records(self, facility_filter):
+        if not facility_filter:
+            return self._dashboard_records
+        wanted = set(facility_filter)
+        return [r for r in self._dashboard_records
+                if (r.get("_source_facility") or r.get("facility")) in wanted]
+
+    def dashboard_compute(self, start_date: str, end_date: str,
+                          facility_filter: list = None) -> dict:
+        """Run compute_all against the cached frame for [start, end]."""
+        if not self._dashboard_records:
+            return {"ok": False, "message": "No linelist loaded."}
+        try:
+            sd, ed = self._parse_iso(start_date), self._parse_iso(end_date)
+        except ValueError:
+            return {"ok": False, "message": "Dates must be YYYY-MM-DD."}
+        records = self._filtered_records(facility_filter)
+        result = dash_indicators.compute_all(
+            records, sd, ed,
+            meta_extra={"sources": self._dashboard_sources,
+                        "facility_filter": facility_filter or []})
+        result["ok"] = True
+        self._log.emit(f"computed indicators {start_date}..{end_date} "
+                       f"({len(records)} rows)", category="DASHBOARD")
+        return result
+
+    def dashboard_refresh_from_db(self, end_date: str) -> dict:
+        """Regenerate the Treatment linelist at @endDate=end_date, then reload.
+        Returns an operation_id; completion is pushed via _push_op_event."""
+        if self.config is None:
+            return {"ok": False, "message": self.config_error or "No configuration."}
+        try:
+            self._parse_iso(end_date)
+        except ValueError:
+            return {"ok": False, "message": "end_date must be YYYY-MM-DD."}
+        op_id = self._next_op_id()
+        threading.Thread(target=self._dashboard_refresh_worker,
+                         args=(op_id, end_date), daemon=True).start()
+        return {"ok": True, "operation_id": op_id}
+
+    def _dashboard_refresh_worker(self, op_id, end_date):
+        import time as _t
+        from .constants import LINELIST_DIR, bundled_scripts
+        t0 = _t.monotonic()
+        self._log.emit(f"refresh from DB starting (@endDate={end_date})", category="DASHBOARD")
+        try:
+            treatment = next((p for name, p in bundled_scripts() if name == "Treatment"), None)
+            if treatment is None:
+                raise RuntimeError("Treatment script not bundled.")
+            sql = treatment.read_text(encoding="utf-8")
+            # Pre-set @endDate; sql:31 (SET @endDate = IFNULL(@endDate, NOW())) honors it.
+            sql = f"SET @endDate = '{end_date} 23:59:59';\n" + sql
+            cols, rows, _ = execute_sql_script(self.config["database"], sql)
+            stamp = datetime.now().strftime("%Y%m%d%H%M")
+            # "asof" name so a snapshot linelist is never mistaken for the current one.
+            out = LINELIST_DIR / f"Treatment_asof_{end_date}_{stamp}.csv"
+            write_linelist_csv(cols, rows, out, False, None)
+            frame = dash_loader.load_linelist(out)
+            self._dashboard_records = frame.records
+            self._dashboard_sources = [frame.source_name]
+            self._log.emit(f"refresh complete: {frame.row_count} row(s) -> {out.name}",
+                           category="DASHBOARD")
+            self._push_op_event({
+                "operation_id": op_id, "op": "dashboard", "event": "done", "ok": True,
+                "source": frame.source_name, "rows": frame.row_count,
+                "facility": frame.facility_name, "end_date": end_date,
+                "elapsed": round(_t.monotonic() - t0, 1),
+                "message": f"Regenerated at {end_date}: {frame.row_count} rows",
+            })
+        except Exception as e:  # noqa: BLE001
+            self._log.emit(f"refresh failed: {e}", category="DASHBOARD", level="error")
+            self._push_op_event({"operation_id": op_id, "op": "dashboard",
+                                 "event": "error", "ok": False, "message": str(e)})
+
+    def dashboard_export(self, indicator_slug: str, start_date: str, end_date: str,
+                         facility_filter: list = None) -> dict:
+        """Compute one indicator and write a banner-headed export CSV."""
+        if not self._dashboard_records:
+            return {"ok": False, "message": "No linelist loaded."}
+        entry = _DASHBOARD_INDICATORS.get(indicator_slug)
+        if entry is None:
+            return {"ok": False, "message": f"Unknown indicator: {indicator_slug}"}
+        name, fn = entry
+        try:
+            sd, ed = self._parse_iso(start_date), self._parse_iso(end_date)
+        except ValueError:
+            return {"ok": False, "message": "Dates must be YYYY-MM-DD."}
+        records = self._filtered_records(facility_filter)
+        indicator = fn(records, sd, ed)
+        res = dash_exports.write_export(indicator_slug, name, start_date, end_date,
+                                        self._dashboard_sources, indicator)
+        self._log.emit(f"exported {indicator_slug} {start_date}..{end_date} "
+                       f"-> {Path(res['path']).name}", category="DASHBOARD")
+        return res
+
+    def dashboard_open_exports_folder(self) -> dict:
+        try:
+            DASHBOARD_EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return _os_open(str(DASHBOARD_EXPORTS_DIR))
