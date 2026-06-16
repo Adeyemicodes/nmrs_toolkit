@@ -31,6 +31,7 @@ from .constants import (
 # also fan out to their long-standing per-workflow files.
 VALID_CATEGORIES = (
     "APP", "BACKUP", "RESTORE", "LINELIST", "MERGE", "UNVOID", "SCHED", "UI",
+    "DASHBOARD",
 )
 VALID_LEVELS = ("info", "warn", "error", "debug")
 

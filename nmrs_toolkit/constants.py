@@ -37,6 +37,13 @@ LINELIST_LOG_FILE = LINELIST_DIR / "linelist.log"
 # @reboot catch-up trigger doesn't regenerate a set already produced this week.
 LINELIST_WEEK_MARKER = LINELIST_DIR / ".last_weekly_run"
 
+# Analytics Dashboard exports. DELIBERATELY separate from LINELIST_DIR: these
+# are point-in-time indicator extracts, NOT current line lists, and must never
+# be mistaken for one (every export also carries a "NOT a current linelist"
+# banner). See nmrs_toolkit/dashboard/exports.py.
+DASHBOARD_EXPORTS_DIR = (Path(r"C:\NMRS_Dashboard_Exports") if platform.system() == "Windows"
+                         else Path.home() / "NMRS_Dashboard_Exports")
+
 # Bump whenever the OS-scheduler definition changes (times, triggers, new jobs)
 # so existing installs re-register on the next launch instead of being skipped
 # by the "already installed" marker.
