@@ -1405,13 +1405,25 @@ class NMRSToolkitApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
-        # Sized for a comfortable first launch on a 1366×768 (and up) facility
-        # laptop; min size keeps every tab + the activity log usable at the
-        # smallest the user can drag the window to. Resizable in both axes —
-        # the previous resizable(False, False) was why the log got clipped
-        # whenever the chosen geometry didn't fit the host screen.
-        self.root.geometry("1150x820")
-        self.root.minsize(950, 700)
+        # Fit the initial window to the host screen. A fixed 1150x820 is TALLER
+        # than a 1366x768 facility laptop, so the bottom of the window — the
+        # Activity Log and the lowest tab controls (notably the Unvoid button) —
+        # opened *below* the screen edge and looked "missing". Clamp to the
+        # available screen, and start maximized on Windows (where the taskbar
+        # eats extra height) so everything is on-screen from the first launch.
+        # Resizable in both axes (the previous resizable(False, False) was the
+        # original cause of off-screen clipping).
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win_w = min(1150, max(900, screen_w - 80))
+        win_h = min(820, max(600, screen_h - 120))
+        self.root.geometry(f"{win_w}x{win_h}")
+        self.root.minsize(min(900, win_w), min(600, win_h))
+        if platform.system() == "Windows":
+            try:
+                self.root.state("zoomed")  # start maximized; user can restore
+            except tk.TclError:
+                pass
 
         self.config = None
         self.connection = None
@@ -3457,7 +3469,7 @@ class NMRSToolkitApp:
             font=("Arial", 11, "bold"), padx=15, pady=15,
         )
         self._unvoid_details = scrolledtext.ScrolledText(
-            details_frame, height=16, font=("Courier", 10),
+            details_frame, height=10, font=("Courier", 10),
             bg="#f5f5f5", relief="solid", bd=1,
         )
         self._unvoid_details.pack(fill="both", expand=True)
