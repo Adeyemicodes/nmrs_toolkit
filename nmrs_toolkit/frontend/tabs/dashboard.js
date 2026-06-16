@@ -62,6 +62,43 @@ export function renderDashboardTab(root) {
   const el = (id) => root.querySelector(id);
   const grid = el('#dash-grid');
 
+  // -- Chart.js (vendored, global window.Chart) ----------------------------
+  const charts = [];
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function destroyCharts() { charts.forEach((c) => { try { c.destroy(); } catch (e) { /**/ } }); charts.length = 0; }
+  function tok(name, fallback) {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return v || fallback;
+  }
+  const COLORS = () => ({
+    navy: tok('--color-primary', '#0B1F3A'),
+    teal: tok('--color-accent', '#1FB6A6'),
+    amber: tok('--color-warning', '#B07015'),
+    danger: tok('--color-danger', '#B23B3B'),
+    success: tok('--color-success', '#1B8B5A'),
+    info: tok('--color-info', '#1E5FAA'),
+    muted: tok('--color-text-faint', '#8A95A4'),
+  });
+  function pctTooltip(getTotal) {
+    return {
+      callbacks: {
+        label(ctx) {
+          const v = ctx.parsed.x != null ? ctx.parsed.x : ctx.parsed.y != null ? ctx.parsed.y : ctx.parsed;
+          const val = Math.abs(typeof v === 'number' ? v : ctx.raw);
+          const total = getTotal ? getTotal(ctx) : null;
+          const pct = total ? ` (${Math.round((100 * val) / total)}%)` : '';
+          return `${ctx.dataset.label || ctx.label}: ${val.toLocaleString()}${pct}`;
+        },
+      },
+    };
+  }
+  function mk(canvas, config) {
+    if (!window.Chart || !canvas) return;
+    config.options = Object.assign({ responsive: true, maintainAspectRatio: false,
+      animation: reduceMotion ? false : undefined }, config.options || {});
+    charts.push(new window.Chart(canvas.getContext('2d'), config));
+  }
+
   // -- date range (instant, in-memory recompute) ---------------------------
   el('#dash-start').addEventListener('change', (e) => { state.start = e.target.value; recompute(); });
   el('#dash-end').addEventListener('change', (e) => { state.end = e.target.value; recompute(); });
@@ -120,6 +157,7 @@ export function renderDashboardTab(root) {
     const end = state.end, start = state.start;
     const asOf = `as of ${esc(end)}`;
     const period = `Period: ${esc(start)} to ${esc(end)}`;
+    destroyCharts();
     grid.innerHTML = `
       <div class="dash__row dash__row--3">
         ${kpiCard('ever_enrolled', 'Ever Enrolled', s.ever_enrolled, asOf)}
@@ -141,6 +179,91 @@ export function renderDashboardTab(root) {
       </div>
       <div class="dash__row">${biometricCard(s.biometric_coverage, asOf)}</div>`;
     wireDisaggChips();
+    buildCharts();
+  }
+
+  // -- Chart.js renderings -------------------------------------------------
+  function buildCharts() {
+    if (!window.Chart) return;  // graceful fallback if vendor file missing
+    const s = state.summary;
+    const c = COLORS();
+    const cv = (name) => grid.querySelector(`canvas[data-chart="${name}"]`);
+    const noLegend = { plugins: { legend: { display: false } } };
+
+    // Cohort flow — horizontal bar, one bar per stage.
+    const cf = s.cohort_flow;
+    mk(cv('cohort'), {
+      type: 'bar',
+      data: { labels: ['Ever Enrolled', 'TX_NEW', 'TX_CURR', 'Currently IIT', 'TX_RTT'],
+        datasets: [{ data: [cf.ever_enrolled, cf.tx_new, cf.tx_curr, cf.currently_iit, cf.tx_rtt],
+          backgroundColor: [c.navy, c.info, c.teal, c.amber, c.success] }] },
+      options: Object.assign({ indexAxis: 'y',
+        plugins: { legend: { display: false }, tooltip: pctTooltip(() => cf.ever_enrolled) },
+        scales: { x: { beginAtZero: true } } }),
+    });
+
+    // VL cascade — horizontal bar, graduated by stage.
+    const vl = s.vl_cascade;
+    mk(cv('vl'), {
+      type: 'bar',
+      data: { labels: ['Eligible', 'Sampled', 'With result', 'Suppressed'],
+        datasets: [{ data: [vl.eligible, vl.sampled, vl.with_result, vl.suppressed],
+          backgroundColor: [c.info, c.teal, c.navy, c.success] }] },
+      options: { indexAxis: 'y',
+        plugins: { legend: { display: false }, tooltip: pctTooltip(() => vl.eligible) },
+        scales: { x: { beginAtZero: true } } },
+    });
+
+    // TX_ML — stacked horizontal bar by reason.
+    const ml = s.tx_ml.by_reason || {};
+    const mlReasons = ['Newly IIT', 'Died', 'Transferred Out', 'Refused/Stopped'];
+    const mlColors = [c.amber, c.danger, c.info, c.muted];
+    mk(cv('txml'), {
+      type: 'bar',
+      data: { labels: ['TX_ML'],
+        datasets: mlReasons.map((r, i) => ({ label: r, data: [ml[r] || 0],
+          backgroundColor: mlColors[i] })) },
+      options: { indexAxis: 'y',
+        plugins: { legend: { position: 'bottom' }, tooltip: pctTooltip(() => s.tx_ml.total) },
+        scales: { x: { stacked: true, beginAtZero: true }, y: { stacked: true } } },
+    });
+
+    // MMD — doughnut.
+    const mb = s.mmd_distribution.by_bucket || {};
+    const mmdKeys = ['<3 months', '3-5 months', '>=6 months', 'Unknown'].filter((k) => mb[k]);
+    mk(cv('mmd'), {
+      type: 'doughnut',
+      data: { labels: mmdKeys, datasets: [{ data: mmdKeys.map((k) => mb[k]),
+        backgroundColor: [c.amber, c.info, c.teal, c.muted] }] },
+      options: { plugins: { legend: { position: 'bottom' },
+        tooltip: pctTooltip(() => s.mmd_distribution.total) } },
+    });
+
+    // Age/sex pyramid — diverging horizontal bar (F negative, M positive).
+    const g = s.age_sex_pyramid.grid || {};
+    const bands = ['Pediatric (0-9)', 'Adolescent (10-19)', 'Adult (20+)'];
+    mk(cv('pyramid'), {
+      type: 'bar',
+      data: { labels: bands, datasets: [
+        { label: 'F', data: bands.map((b) => -((g[b] || {}).F || 0)), backgroundColor: c.teal },
+        { label: 'M', data: bands.map((b) => (g[b] || {}).M || 0), backgroundColor: c.navy }] },
+      options: { indexAxis: 'y',
+        plugins: { legend: { position: 'bottom' },
+          tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${Math.abs(ctx.parsed.x).toLocaleString()}` } } },
+        scales: { x: { stacked: true, ticks: { callback: (v) => Math.abs(v) } }, y: { stacked: true } } },
+    });
+
+    // Biometric — 3-segment horizontal bar.
+    const b = s.biometric_coverage;
+    mk(cv('bio'), {
+      type: 'bar',
+      data: { labels: ['Captured', 'Valid', 'Up to date'],
+        datasets: [{ data: [b.captured, b.valid, b.up_to_date],
+          backgroundColor: [c.info, c.teal, c.success] }] },
+      options: { indexAxis: 'y',
+        plugins: { legend: { display: false }, tooltip: pctTooltip(() => b.total) },
+        scales: { x: { beginAtZero: true } } },
+    });
   }
 
   // -- card builders -------------------------------------------------------
@@ -168,33 +291,18 @@ export function renderDashboardTab(root) {
     </div>`;
   }
   function cohortFlowCard(cf, start, end) {
-    const stages = [
-      ['Ever Enrolled', cf.ever_enrolled, `as of ${end}`],
-      ['TX_NEW', cf.tx_new, `${start}..${end}`],
-      ['TX_CURR', cf.tx_curr, `as of ${end}`],
-      ['Currently IIT', cf.currently_iit, `as of ${end}`],
-      ['TX_RTT', cf.tx_rtt, `${start}..${end}`],
-    ];
     return `<div class="dash-card">
       <div class="dash-card__title">Cohort Flow</div>
-      <div class="dash-flow">${stages.map(([t, n, st]) =>
-        `<div class="dash-flow__stage"><div class="dash-flow__n">${num(n)}</div>
-          <div class="dash-flow__t">${esc(t)}</div><div class="dash-flow__st">${esc(st)}</div></div>`).join('<div class="dash-flow__arrow">→</div>')}</div>
+      <div class="dash-card__sub">Snapshot stages "as of ${esc(end)}"; TX_NEW/TX_RTT for ${esc(start)}..${esc(end)}</div>
+      <div class="dash-chart"><canvas data-chart="cohort"></canvas></div>
       <div class="dash-card__sub">TX_ML this period: ${num(cf.tx_ml_total)} · Dead ${num(cf.dead)} · TO ${num(cf.transferred_out)} · Stopped ${num(cf.stopped)}</div>
     </div>`;
   }
   function vlCascadeCard(vl, stamp) {
-    const step = (label, n, pct) =>
-      `<div class="dash-funnel__step"><span>${esc(label)}</span><span>${num(n)}${pct != null ? ` (${pct}%)` : ''}</span></div>`;
     return `<div class="dash-card" data-indicator="vl_cascade">
       <div class="dash-card__title">VL Cascade</div>
-      <div class="dash-card__sub">${esc(stamp)}</div>
-      <div class="dash-funnel">
-        ${step('Eligible (TX_CURR ≥6mo)', vl.eligible, null)}
-        ${step('Sampled (≤12mo)', vl.sampled, vl.eligible ? Math.round(100 * vl.sampled / vl.eligible) : 0)}
-        ${step('With result', vl.with_result, vl.sampled ? Math.round(100 * vl.with_result / vl.sampled) : 0)}
-        ${step('Suppressed (<1000)', vl.suppressed, vl.suppression_pct)}
-      </div>
+      <div class="dash-card__sub">${esc(stamp)} · coverage ${vl.coverage_pct}% · suppression ${vl.suppression_pct}%</div>
+      <div class="dash-chart"><canvas data-chart="vl"></canvas></div>
       <button class="btn btn--secondary btn--sm" data-export="vl_cascade">Export</button>
     </div>`;
   }
@@ -212,45 +320,33 @@ export function renderDashboardTab(root) {
     </div>`;
   }
   function txmlCard(ml, stamp) {
-    const r = ml.by_reason || {};
     return `<div class="dash-card" data-indicator="tx_ml">
       <div class="dash-card__title">TX_ML</div>
-      <div class="dash-card__sub">${esc(stamp)}</div>
-      <div class="dash-total">${num(ml.total)}</div>
-      <table class="dash-break">${['Newly IIT', 'Died', 'Transferred Out', 'Refused/Stopped']
-        .map((k) => `<tr><td>${esc(k)}</td><td>${num(r[k] || 0)}</td></tr>`).join('')}</table>
+      <div class="dash-card__sub">${esc(stamp)} · total ${num(ml.total)}</div>
+      <div class="dash-chart"><canvas data-chart="txml"></canvas></div>
       <button class="btn btn--secondary btn--sm" data-export="tx_ml">Export</button>
     </div>`;
   }
   function mmdCard(mmd, stamp) {
-    const b = mmd.by_bucket || {};
     return `<div class="dash-card" data-indicator="mmd_distribution">
       <div class="dash-card__title">MMD Share</div>
       <div class="dash-card__sub">${esc(stamp)} · coverage (≥3mo) ${mmd.mmd_coverage_pct}%</div>
-      <table class="dash-break">${['<3 months', '3-5 months', '>=6 months']
-        .map((k) => `<tr><td>${esc(k)}</td><td>${num(b[k] || 0)}</td></tr>`).join('')}</table>
+      <div class="dash-chart"><canvas data-chart="mmd"></canvas></div>
     </div>`;
   }
   function pyramidCard(p, stamp) {
-    const g = p.grid || {};
-    const bands = ['Pediatric (0-9)', 'Adolescent (10-19)', 'Adult (20+)'];
     return `<div class="dash-card" data-indicator="age_sex_pyramid">
-      <div class="dash-card__title">Age / Sex</div>
-      <div class="dash-card__sub">${esc(stamp)} (TX_CURR)</div>
-      <table class="dash-break"><tr><th>Band</th><th>F</th><th>M</th></tr>
-        ${bands.map((b) => `<tr><td>${esc(b)}</td><td>${num((g[b] || {}).F || 0)}</td><td>${num((g[b] || {}).M || 0)}</td></tr>`).join('')}</table>
+      <div class="dash-card__title">Age / Sex Pyramid</div>
+      <div class="dash-card__sub">${esc(stamp)} (TX_CURR) · F ◀ ▶ M</div>
+      <div class="dash-chart"><canvas data-chart="pyramid"></canvas></div>
     </div>`;
   }
   function biometricCard(b, stamp) {
     return `<div class="dash-card" data-indicator="biometric_coverage">
       <div class="dash-card__title">Biometric Capture</div>
-      <div class="dash-card__sub">${esc(stamp)} (TX_CURR)</div>
-      <div class="dash-bio">
-        <div><div class="dash-total">${num(b.captured)}</div><div class="dash-card__sub">Captured</div></div>
-        <div><div class="dash-total">${num(b.valid)}</div><div class="dash-card__sub">Valid</div></div>
-        <div><div class="dash-total">${num(b.up_to_date)}</div><div class="dash-card__sub">Up to date</div></div>
-        <div><div class="dash-total dash-total--amber">${num(b.needs_recapture)}</div><div class="dash-card__sub">Needs recapture</div></div>
-      </div>
+      <div class="dash-card__sub">${esc(stamp)} (TX_CURR) · needs recapture
+        <strong class="dash-amber-inline">${num(b.needs_recapture)}</strong></div>
+      <div class="dash-chart dash-chart--short"><canvas data-chart="bio"></canvas></div>
       <button class="btn btn--secondary btn--sm" data-export="biometric_coverage">Export</button>
     </div>`;
   }
@@ -289,5 +385,5 @@ export function renderDashboardTab(root) {
     await recompute();
   })();
 
-  return { destroy() { subs.forEach((u) => u()); } };
+  return { destroy() { subs.forEach((u) => u()); destroyCharts(); } };
 }

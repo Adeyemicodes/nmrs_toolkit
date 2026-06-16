@@ -59,3 +59,8 @@
 .dash-funnel__step:last-child { background: var(--color-success-bg); color: var(--color-success); font-weight: 600; }
 
 .dash-bio { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-3); text-align: center; }
+
+/* Chart canvases need an explicit height (responsive + maintainAspectRatio:false). */
+.dash-chart { position: relative; height: 220px; }
+.dash-chart--short { height: 130px; }
+.dash-amber-inline { color: var(--color-warning); }

@@ -21,6 +21,9 @@
 </head>
 <body>
   <div id="root"></div>
+  <!-- Chart.js vendored locally (never a CDN). Classic script -> window.Chart
+       global, loaded before the deferred app module. -->
+  <script src="vendor/chart.umd.min.js"></script>
   <script type="module" src="app.js"></script>
 </body>
 </html>
