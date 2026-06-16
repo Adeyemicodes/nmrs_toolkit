@@ -2176,12 +2176,17 @@ class NMRSToolkitApp:
                   bg="#2196F3", fg="white", font=("Arial", 11, "bold"),
                   padx=20, pady=8, cursor="hand2").pack(side="left")
 
-        # Step 2: details
+        # Step 2: details. NOTE: this frame is packed LAST (at the end of this
+        # method), AFTER Step 3's action frame is anchored to the bottom. Tk's
+        # packer clips whichever widget is packed last when the content is taller
+        # than the window — and on Windows the larger default fonts/DPI push this
+        # tab past a non-maximised window. Packing the scrollable details area
+        # last makes IT absorb the overflow (it scrolls) instead of the Unvoid
+        # button dropping off the bottom edge (the reported "no button" bug).
         details_frame = tk.LabelFrame(
             content, text="Step 2: Verify (one block per identifier)",
             font=("Arial", 11, "bold"), padx=15, pady=15,
         )
-        details_frame.pack(fill="both", expand=True, pady=(0, 12))
         self._unvoid_details = scrolledtext.ScrolledText(
             details_frame, height=16, font=("Courier", 10),
             bg="#f5f5f5", relief="solid", bd=1,
@@ -2189,12 +2194,14 @@ class NMRSToolkitApp:
         self._unvoid_details.pack(fill="both", expand=True)
         self._unvoid_details.config(state="disabled")
 
-        # Step 3: action
+        # Step 3: action. Anchored to the bottom and packed BEFORE the expanding
+        # details area, so the button always keeps its space and can never be
+        # pushed off-screen.
         action_frame = tk.LabelFrame(
             content, text="Step 3: Unvoid Patient Records",
             font=("Arial", 11, "bold"), padx=15, pady=15,
         )
-        action_frame.pack(fill="x")
+        action_frame.pack(side="bottom", fill="x", pady=(12, 0))
         tk.Label(action_frame,
                  text="WARNING: unvoids records within the time window of the "
                       "most recent void only.",
@@ -2206,6 +2213,11 @@ class NMRSToolkitApp:
             state="disabled", disabledforeground="#666666",
         )
         self._unvoid_button.pack()
+
+        # Pack the details area into the remaining middle space LAST, so it (not
+        # the Step 3 button above) is what Tk shrinks/clips when the window is
+        # too short. See the Step 2 note above.
+        details_frame.pack(fill="both", expand=True, pady=(0, 12))
 
     def _unvoid_set_button(self, enabled):
         if enabled:
